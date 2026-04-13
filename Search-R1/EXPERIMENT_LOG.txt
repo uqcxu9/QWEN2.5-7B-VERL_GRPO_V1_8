@@ -507,6 +507,153 @@ Rate: 19 step / 18h34m = ~59 min/step (比预估 63 略快)
   - step 56 (epoch 4 完): 2026-04-14 16:00 左右 (全程 ~55h)
 
 
+--- 实验 13 最终终止 (2026-04-13 03:02): step 20 checkpoint 保存时磁盘满 ---
+最终进度: 20 / 56 step 完成 (epoch 2 第 6 步), 运行 19h 38m
+
+一、崩溃根因 (代码+磁盘取证, 不是训练本身 bug)
+  堆栈: fsdp_checkpoint_manager.py:239 -> torch.save(optimizer_state_dict, optim_path)
+  错误: RuntimeError: [enforce fail at inline_container.cc:664].
+        unexpected pos 26931488128 vs 26931488024
+  含义: optim 文件写到 26,931,488,024 字节后, 写 EOF metadata 时磁盘没空间了, 差 104 字节.
+
+  配置: save_freq=20, default_local_dir=verl_checkpoints/<exp_name>
+  触发点: step 20 是首次 save_freq=20 的触发点, v3 之前所有实验都崩在更早的步骤
+          所以 v3 是第一个撞到"磁盘放不下 ckpt"这个隐藏配置缺陷的实验
+
+  残留文件大小:
+    model_world_size_1_rank_0.pt  = 17 GB (fp32 Qwen3-4B 权重, 3.89B × 4B/param)
+    optim_world_size_1_rank_0.pt  = 26 GB (AdamW m+v state, 2× model size, 不完整)
+    总计残留: 43 GB
+
+  磁盘状态:
+    /dev/nvme0n2 容量 99 GB, 保存前已用 ~57 GB, 可用 42 GB
+    /workspace/Search-R1 (checkpoint 残留 42 GB)
+    /workspace/venvs (20 GB) + /workspace/models (15 GB) + /workspace/model (7.6 GB, Qwen3-4B)
+
+  数学上这是必然:
+    43 GB 需求 vs 42 GB 可用 -> 保存从开始就注定失败
+    即使勉强存下, step 40 的第二次保存需要再 43 GB, 累计 86 GB
+    + 其他 57 GB = 143 GB, 远超 99 GB 总盘
+
+二、v3 最终完整 Actor metrics (20 step)
+  step  1 (year=4 ): R=-33.57 pg=0.0198 ppo_kl=0.0048 kl_loss=0.096 grad=3.52
+  step  2 (year=11): R=-42.14 pg=0.0110 ppo_kl=0.0062 kl_loss=0.127 grad=3.06
+  step  3 (year=15): R=-19.62 pg=0.0113 ppo_kl=0.0019 kl_loss=0.237 grad=2.76
+  step  4 (year=9 ): R=-23.50 pg=0.0107 ppo_kl=0.0012 kl_loss=0.207 grad=2.62
+  step  5 (year=13): R=-54.63 pg=0.0105 ppo_kl=0.0009 kl_loss=0.182 grad=3.15
+  step  6 (year=2 ): R= -7.31 pg=0.0089 ppo_kl=0.0014 kl_loss=0.246 grad=3.28
+  step  7 (year=14): R=-25.59 pg=0.0098 ppo_kl=0.0008 kl_loss=0.207 grad=2.25
+  step  8 (year=10): R=-25.20 pg=0.0097 ppo_kl=0.0013 kl_loss=0.261 grad=2.76
+  step  9 (year=6 ): R=-64.57 pg=0.0101 ppo_kl=0.0015 kl_loss=0.254 grad=2.88
+  step 10 (year=3 ): R= -5.38 pg=0.0084 ppo_kl=0.0014 kl_loss=0.315 grad=3.36
+  step 11 (year=12): R=-59.78 pg=0.0087 ppo_kl=0.0009 kl_loss=0.269 grad=2.68
+  step 12 (year=7 ): R=-44.98 pg=0.0079 ppo_kl=0.0006 kl_loss=0.248 grad=2.45
+  step 13 (year=5 ): R=-34.58 pg=0.0077 ppo_kl=0.0010 kl_loss=0.230 grad=1.95
+  step 14 (year=8 ): R=-41.72 pg=0.0070 ppo_kl=0.0016 kl_loss=0.274 grad=1.90  ← epoch 1 结束
+  step 15 (year=8 ): R=-42.04 pg=0.0057 ppo_kl=0.0012 kl_loss=0.294 grad=1.66  ← year=8 revisit (pair 1)
+  step 16 (year=15): R=-20.56 pg=0.0078 ppo_kl=0.0007 kl_loss=0.384 grad=1.92  ← year=15 revisit (pair 2)
+  step 17 (year=9 ): R=-22.43 pg=0.0105 ppo_kl=0.0015 kl_loss=0.435 grad=2.66  ← year=9 revisit (pair 3)
+  step 18 (year=12): R=-58.97 pg=0.0088 ppo_kl=0.0017 kl_loss=0.478 grad=2.34  ← year=12 revisit (pair 4)
+  step 19 (year=7 ): R=-40.38 pg=0.0096 ppo_kl=0.0020 kl_loss=0.559 grad=2.25  ← year=7 revisit (pair 5)
+  step 20 (year=4 ): R=-36.60 pg=0.0093 ppo_kl=0.0012 kl_loss=0.500 grad=1.83  ← year=4 revisit (pair 6)
+
+三、Paired t-test 最终结果 (硬计算, 6 对同 year 重访)
+  配对差 Δ 值:
+    y4:  -33.573 → -36.602  Δ = -3.03  (step 1  → 20)
+    y7:  -44.976 → -40.383  Δ = +4.59  (step 12 → 19)  ← 最大改善
+    y8:  -41.718 → -42.036  Δ = -0.32  (step 14 → 15)
+    y9:  -23.504 → -22.428  Δ = +1.08  (step 4  → 17)
+    y12: -59.777 → -58.966  Δ = +0.81  (step 11 → 18)
+    y15: -19.618 → -20.564  Δ = -0.95  (step 3  → 16)
+
+  统计量:
+    n          = 6
+    Δ_mean     = +0.365
+    Δ_std      =  2.541
+    SE         =  1.037
+    t          = +0.351  (df=5)
+    p (双侧)   = 0.740    ← 完全不显著, 无法拒绝"无学习"零假设
+
+  方向: 3 升 3 降, 完全对称, 不构成学习证据
+  外推: 即使跑到 step 56 获得 28 对, 按当前 Δ_std=2.54, SE≈0.48, 预期 p≈0.45, 仍不显著
+  要证明当前 Δ=0.365 是"真的", 需要 ~400 对 (显然不可能)
+
+四、实测硬事实: 13 项 reward 里 7 项在 4 replica 间完全无方差
+  20 step × 4 replica 的 replica-间 range (max-min) 统计:
+
+  Reward 项                20 step 中 range>0 的次数   平均 range   GRPO 能学吗
+  ────────────────────────────────────────────────────────────────────────────
+  u_ctr   (失业率中心)     0 / 20                     0.000        ❌ 完全无信号
+  u_grd   (失业率 guard)   0 / 20                     0.000        ❌
+  work    (反坍缩)         0 / 20                     0.000        ❌
+  gdp_r   (实际 GDP 中心)  0 / 20                     0.000        ❌
+  gdp_rG  (实际 GDP guard) 0 / 20                     0.000        ❌
+  wpi     (工资通胀中心)   0 / 20                     0.000        ❌
+  wpiG    (工资通胀 guard) 0 / 20                     0.000        ❌
+  gdp_n   (名义 GDP 中心)  20 / 20                    0.77         ✓ 有信号
+  gdp_nG  (名义 GDP guard) 15 / 20                    0.29         ✓ 弱信号
+  pi      (价格通胀中心)   18 / 20                    1.38         ✓ 最强信号
+  piG     (价格通胀 guard) 17 / 20                    0.61         ✓ 有信号
+  fmt                       0 / 20                    0.000        ❌ (格式全 100%)
+  valid                     0 / 20                    0.000        ❌ (全 valid)
+
+  关键结论: 13 项 reward 中 4 项 (pi, piG, gdp_n, gdp_nG) 驱动了 GRPO 的全部学习信号,
+           其他 7 项 (u/work/gdp_r/wpi 相关) 在 4 replica 间数字完全相同, advantage 贡献 = 0.
+
+五、LLM rollout 本身没问题 (反驳"model 有 bug"假设)
+  实测证据 - 同一 step 同一 month, 4 个 replica 的 LLM 输出确实不同:
+
+  rep=0: work_prob mean=0.8764 std=0.126 | cons mean=0.2754 | labor=87/100 | demand≈9576
+  rep=1: work_prob mean=0.8734 std=0.126 | cons mean=0.2818 | labor=87/100 | demand≈9952
+  rep=2: work_prob mean=0.8766 std=0.121 | cons mean=0.2818 | labor=85/100 | demand≈9879
+  rep=3: work_prob mean=0.8742 std=0.126 | cons mean=0.2800 | labor=85/100 | demand≈9866
+
+  - work_prob 均值跨 replica 差 0.003 (policy 不同)
+  - labor 二值化后工作人数差 85 vs 87 (Bernoulli 判定确实翻转)
+  - demand 差 ~400 单位 (下游传导)
+
+  单 agent 层面示例 (agent[0] 同月):
+    rep=0: {"work": 0.82, "consumption": 0.33}
+    rep=1: {"work": 0.82, "consumption": 0.34}    ← cons 不同
+    rep=2: {"work": 0.80, "consumption": 0.35}    ← work 和 cons 都不同
+
+  pi 和 gdp_n 的 replica 差异也证明 LLM/梯度 pipeline 正常:
+    replica 0-3 pi:    -7.262 / -8.311 / -8.569 / -7.125 (全不同)
+    replica 0-3 gdp_n: -0.781 / -1.276 / -1.398 / -0.717 (全不同)
+
+六、u_ctr/wpi/gdp_r 为何仍完全一致 (三重压扁机制, 不是 model bug)
+  replica 差异从 0.003 量级压到 <0.001 打印精度的三个因素:
+
+  (1) CRN 共享环境随机性 (econ_generation_manager.py:879-883)
+      bernoulli_crn: (num_months, num_agents) U[0,1] 表, 4 replica 共享
+      env_rng_seed: 单一 env seed, 4 replica 共享
+      -> wage/price 扰动路径 4 replica 完全一致
+      -> Bernoulli 工作决策只在 work_prob 跨阈值 u_i 时才翻转
+      -> wpi 直接变成跨 replica 恒等值
+
+  (2) 100-agent 聚合 × 1/√100 噪声降
+      单 agent policy 差 0.003 × √(1/100) = 0.0003 量级的宏观指标差
+
+  (3) Huber 二次区 + 操作点在历史均值附近
+      v3 的 u_r ≈ 6% 接近 US 历史 μ_u=6.09%, 所以 z_u ≈ 0
+      Huber(z) 在 |z|<1 是 0.5·z^2, z≈0 时 dH/dz = z ≈ 0
+      -> 任何小 u_r 差异在 Huber 下被二次压扁到 0.001 打印精度以下
+
+  为何 pi / gdp_n 活下来:
+    consumption → demand → price 链路不经 CRN 对齐
+    demand = Σ(cons_i × wealth_i) 随 policy cons 直接变化
+    price 对 demand/supply 比值敏感, 差异被放大而非压扁
+    v3 的 pi 经常 |z|>1 落在 Huber 线性区, 不压扁
+
+七、v3 价值与结论
+  ✓ 证明训练框架稳定: 20 step 格式 100/100, 熵自愈 2 次, ppo_kl<0.007 全程
+  ✓ 证明 seq-mean-token-mean + lr=1e-6 是稳定配置 (可直接被 v4 沿用)
+  ✓ 提供"无学习"对照基线 (p=0.74)
+  ✓ 定位根因: 不是 reward 公式错, 而是 CRN + 100-agent + Huber 三重压扁信号
+  ✗ 无法证明 reward 真的在改善
+  ✗ 暴露 ckpt 磁盘规划缺陷 (v4 必须规避)
+
+
 --- 实验 14 (规划, 还未开始): N=50 agents + seq-mean-token-mean + 加速优化 ---
 日期: 2026-04-13 规划
 代号: v4
@@ -586,7 +733,84 @@ Rate: 19 step / 18h34m = ~59 min/step (比预估 63 略快)
   - 若 step 28 显示 |Δ_mean| < 1 或方向混乱 → 判定 v3 config 下限, 立即 kick off v4
   - 若 step 28 显示 Δ_mean < -2 → 训练退化, 立即 stop + kick off v4
 
-状态: 等 v3 step 28 paired 结果
+状态: v3 step 20 崩 (disk full), 不等了, 直接启 v4 在 Bunya HPC
+
+
+--- 实验 14 (v4) 启动前最终 checklist (2026-04-13, v3 崩后更新) ---
+环境: Bunya HPC (CUDA driver 待查, vLLM 0.11.0-cuda 模块, /scratch 2.2P)
+
+A. 必改 4 条 (缺哪条 v4 跑不起来或跑错)
+  1. ++econ.num_agents=50
+     依据: v4 核心假设; QWEN3-4B_2507_50_AGENTS/simulate.py 验证过 N=50 env 可构造.
+  2. actor_rollout_ref.actor.ppo_mini_batch_size=600
+     依据: EXPERIMENT_LOG 教训 #10 "mini_batch=整 replica 避免 advantage 抵消".
+           N=50 × 12 month = 600.
+  3. ++econ.state_bank_path=/scratch/user/uqcxu9/v4/<path-to-50a-state_bank_train.json>
+     依据: 现有 state_bank_4b 是 100-agent pickle, N=50 env restore 时 shape mismatch.
+  4. ++econ.project_root=/scratch/user/uqcxu9/v4/QWEN2.5_42_7b_main
+     依据: verl 从这里 import rollout_collector / reward_builder / grpo_exporter.
+
+B. 建议改 3 条 (v3 实测教训)
+  5. trainer.save_freq=56  或  ++trainer.max_actor_ckpt_to_keep=1
+     依据: v3 崩因分析, 单 ckpt=43GB, Bunya /scratch 虽不缺空间但保留所有 ckpt 没必要.
+  6. actor_rollout_ref.rollout.gpu_memory_utilization=0.20  (不是 0.55)
+     依据: v3 实测 gpu_util=0.18 时 nvidia-smi 79.9GB/80GB 99% 占用;
+           0.55 会让 vLLM 吃 44GB + PyTorch 需 63GB = 107GB, 必 OOM.
+           Bunya "GPU 不能闲置" 规则检查的是 utilization (训练满用), 非 memory allocation.
+  7. 若 Bunya CUDA driver ≥590, 可开:
+       ++actor_rollout_ref.rollout.enable_sleep_mode=true
+       actor_rollout_ref.rollout.free_cache_engine=true
+       actor_rollout_ref.rollout.gpu_memory_utilization=0.35
+     依据: SETUP_GUIDE §7.2 - driver ≥590 的 vLLM 0.11 cumem 没 bug,
+           sleep_mode 让 update 阶段 vLLM 释放 14GB, 真的能开更大 micro_batch.
+
+C. 不要动的 5 条 (v3 已验证稳定)
+  8. lr=1e-6
+     依据: v3 全程 ppo_kl ∈ [0.001, 0.007] 远低于 trust region 警戒 0.2;
+           pg_loss 0.006-0.020 有信号不过冲. 是 Qwen3-4B + seq-mean 组合下的稳定下限.
+  9. loss_agg_mode=seq-mean-token-mean
+     依据: 对齐 thought.txt §Stage 9 公式; 回退 token-mean 会重现实验 11 的
+           bf16=0.07% 梯度抵消问题 (99.9% 参数不变).
+  10. kl_loss_coef=0.001
+     依据: v3 kl_loss ∈ [0.1, 0.56], coef×loss = 0.0006 贡献小但 policy 没过度飘;
+           改 0.002 增加实验变量但无数据依据.
+  11. ppo_epochs=2
+     依据: 实验 9 教训 "ppo_epochs=1 + mini_batch=1200 会走 on-policy 分支 ratio=1",
+           失 PPO clipping 保护, 等效 REINFORCE.
+  12. ppo_micro_batch_size_per_gpu=2 / enable_gradient_checkpointing=true
+     依据: v3 在 gpu_util=0.18 下就占 99%; 若真要改必须 1 step OOM 压测.
+           v4 下 N=50 activations 减半但 PyTorch 固定开销 ~56GB 不变.
+
+D. 明确不建议做的事 (数据反对, 不是意见)
+  ❌ 改 reward 公式: 13 项公式 thought.txt 已审计正确, v3 数据证明 pi/gdp_n 两通道
+      确实给 GRPO 可用梯度, 问题是 7 项被聚合压扁, 改公式不解决聚合问题.
+  ❌ 加 entropy_coeff=0.001: v3 实测两次窄熵 (rollout 12 cons_std=0.034,
+      rollout 19 cons_std=0.039) 都发生在 **year=7 rollout** 不是 year=4,
+      "inflation 通道问题" 的诊断数据前提错, 且两次都自愈, 不需要干预.
+  ❌ 去 bernoulli_crn: 会让 reward 方差回到 env 噪声 + policy 混合,
+      GRPO 学噪声, 实验 8-9 已踩过这个坑.
+  ❌ 改 Huber δ 或 z-score: 公式正确, 仅是近零区梯度天然小, 改动破坏 reward scale.
+  ❌ 回退 token-mean: 实验 11 证明 bf16=0.07%, 梯度抵消不学.
+
+E. v4 启动后唯一判决点 (不用等 step 28)
+  step 1 actor update 完成后立刻 grep:
+    [econ-debug] replica 0: ... u_ctr=X1 ... gdp_r=X2 ... wpi=X3 ...
+    [econ-debug] replica 1: ... u_ctr=Y1 ... gdp_r=Y2 ... wpi=Y3 ...
+    [econ-debug] replica 2: ... u_ctr=Z1 ... gdp_r=Z2 ... wpi=Z3 ...
+    [econ-debug] replica 3: ... u_ctr=W1 ... gdp_r=W2 ... wpi=W3 ...
+
+  判决标准:
+    任何一项 (u_ctr / gdp_r / wpi) 4 值不再完全相同 (range > 0.001)
+    → v4 假设成立, 继续跑 56 step
+    v3 实测都是 -0.001 × 4 / -2.625 × 4 / -14.775 × 4, 完全相同
+
+    若 v4 仍是 X × 4 (range = 0.000) →  50 agent 也不够,
+    下一步考虑 N=25 或去 bernoulli_crn 的 env 随机性共享.
+
+  优势: 15-30 分钟就能判决, 不用等 14h 跑完 epoch 2.
+
+
+--- 实验 14 (规划, 还未开始): N=50 agents + seq-mean-token-mean + 加速优化 [旧版草稿, 已被上面 checklist 取代] ---
 
 
 六、所有代码改动清单
@@ -839,6 +1063,34 @@ logger:        wandb (EconAgent-GRPO project)
       - old_log_prob + ref_log_prob: ~10 min (4800 / 16 = 300 forward × 2)
       - actor update: ~35 min (4800 × 2 epoch / 2 micro = 4800 fwd+bwd)
       - 小计 ~63 min, 与实测 59 min/step 一致
+25. Checkpoint 磁盘规划 (v3 step 20 崩教训):
+    verl FSDP ckpt 每次保存大小 = model 权重 (fp32 = 4×params) + optim (AdamW m+v = 2×model)
+    Qwen3-4B 单次 ckpt = 17GB + 26GB = 43GB
+    trainer.save_freq=N 决定保存频率; 不清理前 ckpt 时, K 次保存 = K×43GB
+    V3 99GB 盘在 step 20 首次保存时差 104 字节写 EOF 挂
+    修复: 用大盘 (Bunya /scratch), + trainer.max_actor_ckpt_to_keep=1 只留最新
+26. LLM rollout vs 宏观 reward 方差的区别 (v3 实测证伪"rollout 一致"的直觉):
+    实测 v3 step 1 month 0 的 4 replica 不是输出一致:
+      rep=0: work_prob 0.8764, cons 0.2754, labor 87/100, demand 9576
+      rep=1: work_prob 0.8734, cons 0.2818, labor 87/100, demand 9952
+      rep=2: work_prob 0.8766, cons 0.2818, labor 85/100, demand 9879
+      rep=3: work_prob 0.8742, cons 0.2800, labor 85/100, demand 9866
+    单 agent[0] 跨 replica 也不一致 (temperature=0.6 采样).
+    LLM rollout 正常, 但:
+      u_ctr / wpi / gdp_r 在 13 项 reward 里 7 项在 4 replica 间完全相同 (0.001 精度)
+      pi / gdp_n / piG / gdp_nG 4 项有 replica 差异
+    原因: (1) CRN 对齐 env wage/price; (2) 100-agent 聚合 ×1/√100;
+          (3) Huber 二次区近零梯度 (v3 u_r≈6% ≈ 历史 μ=6.09%)
+    三重相乘把 0.003 policy 差压到 <0.001 打印精度
+    结论: 不是 model bug, 是 reward aggregation 的系统性信号丢失
+27. Paired t-test 的 power 与 n 需求 (v3 的 6 对结果 → v4 判决策略):
+    v3 6 对: Δ_mean=+0.365, Δ_std=2.541, SE=1.037, t=0.35, p=0.74
+    外推: n=14 时 SE ≈ 0.68, t ≈ 0.54, p ≈ 0.6 仍不显著
+          n=28 时 SE ≈ 0.48, t ≈ 0.77, p ≈ 0.45 仍不显著
+    若真信号 Δ_mean=0.365 Δ_std=2.541, 需 n ≈ 400 才能 80% power 检出 p<0.05
+    → 继续延长训练 (v3 cont 或 v4 重跑) 不能挽救
+    → 只有 fix 根因 (让更多 reward 维度有 replica 方差) 才可能在可行 n 下出信号
+    → v4 step 1 grep replica 间 u_ctr range 是比 paired t-test 更早且更明确的判决
 
 十二、W&B 监控指标
 ==================
