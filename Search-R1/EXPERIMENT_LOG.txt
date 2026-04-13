@@ -424,22 +424,170 @@ Step 6 (year=2, rollout 完成, actor 进行中):
   group_rewards: [-7.71, -7.48, -7.07, -6.99] (year=2 只有 u/GDP 激活, 无 inflation)
   rep=0 m=0 post-step5: work 0.863/0.134, cons 0.334/0.076
 
-5h15m 进度总结 (截至 2026-04-12 12:39):
-  - 5 完整 step + step 6 rollout 完成
-  - Rate ~63 min/step, 56 step 全程约 58h
-  - ppo_kl 单调下降 0.005 → 0.001 (ratio 越来越接近 1)
-  - kl_loss 在 step 3 达峰 0.237 后回落 0.207 → 0.182 (策略收敛)
-  - pg_loss 稳定 0.010-0.020 (梯度信号没死)
-  - grad_norm 稳定 2.62-3.52
-  - bf16_changed 稳定 0.01% (vs 实验 11 的 0.07%, 但 policy 实际在变)
-  - 288 个 "100/100 responses contain braces" 记录: 全程格式 100% 通过
-  - fmt/valid 24 次检查全为 -0.000
-  - policy 演化: cons mean 0.275 → 0.35 区间稳定, work mean 0.876 → 0.84 区间震荡
-  - 熵: work_std 0.13-0.23 区间浮动, cons_std 0.08-0.14 区间, 均 > 0.05 无坍缩
+完整 Actor metrics (截至 2026-04-13 02:00, 19 step, 进程仍在跑):
+  step  1 (year=4 ): R=-33.573  pg=0.0198  ppo_kl=0.00481  kl_loss=0.096  grad=3.52  clip=0.0076
+  step  2 (year=11): R=-42.145  pg=0.0110  ppo_kl=0.00620  kl_loss=0.127  grad=3.06  clip=0.0088
+  step  3 (year=15): R=-19.618  pg=0.0113  ppo_kl=0.00185  kl_loss=0.237  grad=2.76  clip=0.0065
+  step  4 (year=9 ): R=-23.504  pg=0.0107  ppo_kl=0.00124  kl_loss=0.207  grad=2.62  clip=0.0056
+  step  5 (year=13): R=-54.628  pg=0.0105  ppo_kl=0.00091  kl_loss=0.182  grad=3.15  clip=0.0060
+  step  6 (year=2 ): R= -7.311  pg=0.0089  ppo_kl=0.00139  kl_loss=0.246  grad=3.28  clip=0.0059
+  step  7 (year=14): R=-25.594  pg=0.0098  ppo_kl=0.00084  kl_loss=0.207  grad=2.25  clip=0.0052
+  step  8 (year=10): R=-25.200  pg=0.0097  ppo_kl=0.00134  kl_loss=0.261  grad=2.76  clip=0.0066
+  step  9 (year=6 ): R=-64.570  pg=0.0101  ppo_kl=0.00149  kl_loss=0.254  grad=2.88  clip=0.0062
+  step 10 (year=3 ): R= -5.381  pg=0.0084  ppo_kl=0.00137  kl_loss=0.315  grad=3.36  clip=0.0056
+  step 11 (year=12): R=-59.777  pg=0.0087  ppo_kl=0.00094  kl_loss=0.269  grad=2.68  clip=0.0061
+  step 12 (year=7 ): R=-44.976  pg=0.0079  ppo_kl=0.00055  kl_loss=0.248  grad=2.45  clip=0.0058
+  step 13 (year=5 ): R=-34.575  pg=0.0077  ppo_kl=0.00096  kl_loss=0.230  grad=1.95  clip=0.0057
+  step 14 (year=8 ): R=-41.718  pg=0.0070  ppo_kl=0.00158  kl_loss=0.274  grad=1.90  clip=0.0058  ← epoch 1 结束
+  step 15 (year=8 ): R=-42.036  pg=0.0057  ppo_kl=0.00119  kl_loss=0.294  grad=1.66  clip=0.0058  ← epoch 2 开始, year=8 revisit
+  step 16 (year=15): R=-20.564  pg=0.0078  ppo_kl=0.00068  kl_loss=0.384  grad=1.92  clip=0.0063  ← year=15 revisit
+  step 17 (year=9 ): R=-22.428  pg=0.0105  ppo_kl=0.00146  kl_loss=0.435  grad=2.66  clip=0.0064  ← year=9 revisit
+  step 18 (year=12): R=-58.966  pg=0.0088  ppo_kl=0.00166  kl_loss=0.478  grad=2.34  clip=0.0065  ← year=12 revisit
+  step 19 (year=7 ): R=-40.383  pg=0.0096  ppo_kl=0.00202  kl_loss=0.559  grad=2.25  clip=0.0069  ← year=7 revisit
 
-状态: 正在运行
-尚未证明 "reward 真的在改善" — 6 个 step 全是不同 year (4,11,15,9,13,2),
-同 year 首次重访预计 step 12-15 (~8 小时后, 约 2026-04-12 20:00)
+Rate: 19 step / 18h34m = ~59 min/step (比预估 63 略快)
+全程预估: 56 step * 59 min = ~55 h
+进度: epoch 1 (step 1-14) 完, epoch 2 (step 15-28) 跑到第 5 step
+
+全程训练稳定性 (重点):
+  - ppo_kl:   始终 < 0.007 (trust region 范围 < 0.2 远未触及)
+  - clipfrac: 稳定 0.005-0.009 (PPO clipping 仍在作用, 没 degenerate 到 ratio=1)
+  - kl_loss:  step 1 的 0.096 上升到 step 19 的 0.559 (单调上升, 但 coef=0.001 下 kl_loss×coef=0.0006 对总 loss 影响仍小)
+  - grad_norm: step 15 触底 1.66 后回升到 2.25 (2 epoch 切换后 policy 在新轨迹上又有信号)
+  - pg_loss:  下降放缓, 0.020 → 0.006 → 0.010 (step 15 触底后震荡)
+  - bf16_changed 稳定在 0.01% 全程 (每 optimizer.step 约 4 万参数 cast 后可见变化)
+  - fmt/valid: 76 次检查全为 -0.000, 格式 100/100 全程通过
+
+同 year 重访配对 (首批 5 个点, 这是唯一能判断"是否真在学"的证据):
+  year  首访 step / R      重访 step / R      Δ R_macro
+  ──────────────────────────────────────────────────────
+  8     14 / -41.72         15 / -42.04       -0.32
+  15    3  / -19.62         16 / -20.56       -0.94
+  9     4  / -23.50         17 / -22.43       +1.08
+  12    11 / -59.78         18 / -58.97       +0.81
+  7     12 / -44.98         19 / -40.38       +4.59
+
+  配对差 Δ 平均值 = +1.04 (5 个点, 其中 3 个改善, 2 个轻微退步)
+  标准差 σ ≈ 2.1, SE = 2.1/√5 ≈ 0.94, Δ_mean/SE ≈ 1.1 → p ≈ 0.3 双侧 t-test 不显著
+  结论: 5 个点不足以拒绝 "无变化" 零假设. 但趋势整体偏正, 最大改善 year=7 的 +4.59 超过噪声
+  需更多配对 (至少 10+) 才能做出有意义统计判断; epoch 2 完成 (step 28) 时有 14 对
+
+策略演化 (rep=0 m=0, 16 rollout, 同起点):
+  rollout  起点         work mean/std       cons mean/std       备注
+  ─────────────────────────────────────────────────────────────────
+  1        base model   0.876/0.126         0.275/0.107         起点
+  2        post step 1  0.868/0.140         0.370/0.091         cons mean +0.095 大跳 (step 1 更新)
+  3        post step 2  0.848/0.225         0.368/0.135         work_std 上升
+  4        post step 3  0.837/0.193         0.352/0.106
+  5        post step 4  0.762/0.235         0.379/0.103         work mean -0.075 (最大跳跃)
+  6        post step 5  0.863/0.134         0.334/0.076         反弹 work +0.101
+  7        post step 6  0.825/0.230         0.363/0.128
+  8        post step 7  0.833/0.182         0.350/0.106
+  9        post step 8  0.795/0.170         0.365/0.069
+  10       post step 9  0.850/0.119         0.291/0.093
+  11       post step 10 0.794/0.178         0.382/0.096
+  12       post step 11 0.851/0.079         0.352/0.034         最窄熵点 (cons_std=0.034)
+  13       post step 12 0.854/0.133         0.350/0.090         熵反弹, 自愈
+  14       post step 13 0.807/0.173         0.361/0.071
+  15       post step 14 0.805/0.184         0.364/0.075
+  16       post step 15 0.842/0.207         0.344/0.137
+
+  关键: rollout 12 的 cons_std=0.034 非常接近实验 12 崩溃前的坍缩前兆值,
+  但 step 12 update 后 rollout 13 熵反弹到 0.090, **自发恢复**, 没进入不可逆坍缩.
+  这跟实验 12 (lr=1e-5 + seq-mean 一击到 cons_std=0) 形成鲜明对比: lr=1e-6 下短暂窄熵可自愈.
+
+  策略整体方向:
+  - cons mean: 0.275 → 0.34-0.38 区间稳定 (提高消费)
+  - work mean: 0.876 → 0.80-0.86 区间震荡 (降低但不单调)
+  - 经济直觉: 模型学到 "多消费+少工作" 的方向, 与 baseline Run 1 均值 (cons≈0.4-0.5, work≈0.7-0.9) 接近
+
+状态: 正在运行, 预计:
+  - step 28 (epoch 2 完): 2026-04-13 12:00 左右, 届时将有 14 个配对做 paired t-test
+  - step 42 (epoch 3 完): 2026-04-14 02:00 左右
+  - step 56 (epoch 4 完): 2026-04-14 16:00 左右 (全程 ~55h)
+
+
+--- 实验 14 (规划, 还未开始): N=50 agents + seq-mean-token-mean + 加速优化 ---
+日期: 2026-04-13 规划
+代号: v4
+
+动机 (4 条, 按重要性排序):
+1. 【GRPO 梯度死区】实验 13 证实 100 agent 下 4 个 replica 间 u_ctr / wpi / gdp_r 完全一致
+   (参见 §九.5 之前已注明), 这些 reward 项对 GRPO 毫无梯度信号,
+   学习实际只走 consumption → demand → price 一条因果链, 驱动 pi_center/guard 和
+   gdp_n_center/guard 两个宏观信号.
+   - 根因: 100 个独立 Bernoulli 工作决策 × 独立 skill 后平均, 个体差异被抹平,
+     replica 间宏观聚合一致 (CRN + 环境随机性固定下, agent-aggregate → 确定性)
+   - 50 agent 下单 agent 对 labor_rate 的贡献从 1/100=0.01 翻倍到 1/50=0.02
+   - 预期: u_ctr / wpi / gdp_r 在 replica 间首次出现非零方差 → GRPO 获得梯度信号
+
+2. 【训练太慢】当前 ~59 min/step, 4 epoch 需 ~55h, 单次实验一天半
+   - 每 step 4800 样本 (4 replica × 100 agent × 12 month)
+   - N=50 下 → 2400 样本, 单 step 预计 ~34 min (线性), 4 epoch 降到 ~32h
+
+3. 【可叠加的正交优化】以下 3 条和 agent 数独立, 理论可再加速:
+   (a) ppo_micro_batch_size_per_gpu: 2 → 8 (~3× update speed)
+   (b) enable_gradient_checkpointing: true → false (~1.3× backward)
+   (c) log_prob_micro_batch_size: 16 → 32 (~5% log_prob 快)
+   注意: (a)(b) 需要先 1 step 压测 OOM —— 当前 lr=1e-6 + N=100 实测 GPU
+   79.9GB/80GB (99% 占用), 余量 1.6GB; N=50 下激活减半, 但仍需验证
+   wandb 显示的 "50% GPU Memory Allocated" 只是 torch.cuda.memory_allocated(),
+   不含 vLLM reserved 14GB 和 CUDA context, 不代表真实空余. 必须以 nvidia-smi 为准.
+
+4. 【与原论文偏差可控】ACL24 标准 N=100, 但:
+   - 失业率 stderr: 100 agent 下 √(p(1-p)/100) ≈ 0.036 → 50 agent 下 ≈ 0.051, × √2
+   - 仍落在 US 历史 unemployment 区间 [3.5%, 14.8%] 内
+   - 失业率分辨率: 1/50 = 0.02 (US 最低 3.5% = 1.75 agent 向上取整到 2, 误差 0.25%, 可接受)
+   - 二项噪声对 z-score Huber 影响有限 (huber 1-norm 区域外线性增长)
+
+预期改动:
+  训练侧 (train_econ_grpo_qwen3_4b.sh):
+    ++econ.num_agents: 100 → 50
+    actor_rollout_ref.actor.ppo_mini_batch_size: 1200 → 600 (保持 = 1 replica 样本量)
+    其余不动 (lr=1e-6, seq-mean-token-mean, ppo_epochs=2)
+
+  可选加速 (需先压测):
+    actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu: 2 → 8
+    actor_rollout_ref.model.enable_gradient_checkpointing: true → false
+    actor_rollout_ref.rollout.log_prob_micro_batch_size: 16 → 32
+
+  State bank:
+    当前 state_bank_4b 是 100-agent Run 1 生成, 不能用于 N=50
+    需重建: 用 /workspace/QWEN3-4B_2507_50_AGENTS 跑一次 20 年 Qwen3-4B baseline
+            (simulate.py --policy_model gpt --model_type qwen --num_agents 50 --episode_length 240)
+    产出 20 个 year snapshot, 切 train (y2-15) / val (y16-18) / test (y19-21)
+    预估耗时: 240 月 × 50 agent × vLLM 批推理, 约 3-6h
+
+预期收益 (净账, 含 state bank 重建):
+  当前 v3: 剩余 37 step × 59 min = 36h (不完整 v3)
+  v4 cold start: state bank 重建 3-6h + 训练 56 × 34 min = ~35h → 总 ~38-41h
+  v4 + 优化 (若通过压测): 3-6h + 56 × ~15 min = ~17-20h → 总 ~20-26h
+  → v4 朴素方案 ≈ v3 继续跑, v4 + 加速可省 10-15h
+
+真正的价值:
+  不是省时间, 而是 **让 u_ctr/wpi/gdp_r 有梯度信号**.
+  这改变 GRPO 能学习的 reward 维度从 2 个 (pi, gdp_n) 扩到 5 个 (+u, wpi, gdp_r).
+
+丢弃 v3 进度的成本分析:
+  v3 17 step 下 bf16_changed=0.01%/step 累计 17 × 0.01% = 0.17% 参数 bf16 可见变化
+  实际 policy 演化幅度: cons mean 0.275 → 0.35 (移动 0.075), work mean 0.876 → 0.84 (移动 0.036)
+  v4 的 actor warm start 从 v3 checkpoint 继续? → 不建议, 因为:
+    - state bank 换了 (不同初始状态), 环境不同
+    - v3 policy 已偏向 "100 agent 下最优", 和 N=50 下最优不一样
+    - 从 base model (Qwen3-4B-Instruct-2507) 重启更干净
+  → cold start 是对的, v3 的 17 step 全部作废 (但损失小, policy 没漂远)
+
+问题: 另一 instance 已经在 /workspace/QWEN4B_2507_50AGENTS 跑 baseline
+  → 这个 baseline 可以直接用来建 state bank, 不用重跑
+  → v4 的 state bank 部分耗时可能已经在进行中, 不占额外时间
+
+决策点 (等待):
+  - 若 v3 到 step 28 的 14 个 paired 显示 Δ_mean > 2 且 p < 0.1 → v3 有学习, 跑完 56 step
+  - 若 step 28 显示 |Δ_mean| < 1 或方向混乱 → 判定 v3 config 下限, 立即 kick off v4
+  - 若 step 28 显示 Δ_mean < -2 → 训练退化, 立即 stop + kick off v4
+
+状态: 等 v3 step 28 paired 结果
+
 
 六、所有代码改动清单
 =====================
@@ -651,6 +799,46 @@ logger:        wandb (EconAgent-GRPO project)
 18. R_macro 跨 year 不可比: state bank train 14 year (y2-15) 环境基线差异巨大,
     year 2 (无 inflation 激活) R_macro ≈ -7, year 13 ≈ -54. 要判断 "reward 改善"
     必须等同 year 重访 (首次出现在 epoch 2 的首个 step, 约 step 12-15)
+19. wandb 的 "GPU Memory Allocated" 不是真实显存余量:
+    实测 v3 训练时 wandb 显示 ~50%, 但 nvidia-smi 显示 79.9GB/80GB (99%), 余量 1.6GB.
+    差值 ~40GB 分布: vLLM 预留 14GB (gpu_memory_utilization=0.18 × 80) +
+    CUDA context + PyTorch reserved-but-not-allocated cache + optimizer swap-in 空间.
+    wandb 只记 torch.cuda.memory_allocated() (当前 allocated tensor), 不反映真余量.
+    调 micro_batch / 关 grad_ckpt 前必须以 nvidia-smi 为准, 不然必 OOM.
+20. CUDA driver 580.95 + vLLM 0.11.2 cumem bug 锁死 sleep_mode/free_cache_engine:
+    (ECON_GRPO_QWEN3_SETUP_GUIDE.txt §7.2 有记录)
+    → 当前脚本故意设 VLLM_USE_CUMEM=0 + enable_sleep_mode=false + free_cache_engine=false
+    → vLLM update 阶段不释放 14GB, 加大了显存压力
+    → 只有 CUDA driver >= 590 + vLLM 0.11 才能安全开启 sleep_mode, 届时可:
+      - gpu_memory_utilization 调到 0.35+
+      - update 阶段 vLLM 释放 → 真正 ~15GB 余量 → micro_batch 可上到 8 或 16
+      - 预估速度 ~20 min/step
+21. 训练稳定性的多维监控 (仅看 pg_loss/ppo_kl 会骗人):
+    实验 12 崩坏后 step 2-3 pg_loss=0.016→0.002, ppo_kl 从 1.02→0.002 急降 —— 看起来像"收敛"!
+    但真相是 policy 已坍缩到固定点, ratio≈1 → pg_loss≈0 是假性收敛.
+    必须同时监控:
+    (a) rep=0 m=0 的 work_std / cons_std (坍缩的直接信号, < 0.02 = 危险, < 0.005 = 已死)
+    (b) 4 replica 的 group_rewards range (全相同 = advantage=0 = 无梯度)
+    (c) kl_loss vs ref (策略飘走多远, 持续 > 1 要警惕)
+    (d) fmt/valid/format_fail_count (格式崩的另一种表型)
+22. GRPO 配对分析的统计学: 5 个配对不够做显著性判断
+    - 5 点 t-test 的 power 极低 (Δ_mean/SE ≈ 1.1 → p > 0.25)
+    - 需 14 个配对 (epoch 2 完) 做 paired t-test 才有 ~80% power 检出 Δ = σ 的效应
+    - 真正的 n=14 point-estimate 在 step 28 可得
+    - 注意: 同 year 配对也不完全独立 (更新 path 有累积效应), 但至少比跨 year 可比得多
+23. 熵短暂窄化后可自愈 (实验 13 rollout 11→12→13 实测):
+    rollout 12 cons_std 从 0.096 急降到 0.034 (接近实验 12 坍缩前兆值)
+    但 rollout 13 立即反弹到 0.090, 没进入不可逆坍缩
+    → lr=1e-6 + seq-mean 配置下有一定 "弹性", 短暂窄熵不必立即 abort
+    → 判停标准不是 "见到窄熵" 而是 "连续 2 个 rollout std < 0.02"
+24. 一个 step 的时间构成 (从 DIAG 行间距倒推):
+    每 8 个 DIAG (= 1 个 training step 的 4 mini × 2 epoch = 8 optimizer.step) 紧凑连续
+    DIAG 之间 gap ~300 行 log (= 下个 step 的 rollout + old_log_prob + ref_log_prob)
+    粗估各 phase 占比:
+      - rollout: ~18 min (4 replica × 12 月 × 100 agent / vLLM 批 16)
+      - old_log_prob + ref_log_prob: ~10 min (4800 / 16 = 300 forward × 2)
+      - actor update: ~35 min (4800 × 2 epoch / 2 micro = 4800 fwd+bwd)
+      - 小计 ~63 min, 与实测 59 min/step 一致
 
 十二、W&B 监控指标
 ==================
@@ -678,5 +866,73 @@ actor/kl_loss                 KL 散度 loss
 actor/entropy_loss            策略熵
 actor/grad_norm               梯度范数
 critic/score/mean             总 reward 均值
+
+
+十三、v4 启动准备 (N=50 规划, 代码已就位)
+===========================================
+
+13.1 50-agent baseline 仿真目录
+  路径: /workspace/QWEN3-4B_2507_50_AGENTS/
+  包含: simulate.py, simulate_utils.py, rollout_collector.py, build_state_bank.py,
+        ai_economist/, config.yaml, data/profiles.json
+  验证过:
+    - fire.Fire(main) 接受 --num_agents 50 --episode_length 240
+    - env_config['n_agents'] = num_agents 正确覆盖 config.yaml 的 n_agents: 100
+    - make_env_instance + N=50 实测成功 (50 agent 有 name/job/skill, agent[50] 不存在)
+    - env.step + 50 dummy actions 返回 obs/rew 各 51 条 (50 agent + planner)
+  已知小问题 (非 blocking):
+    (a) ai_economist/.../one_step_economy.py 用硬编码 open('data/profiles.json')
+        必须 cd /workspace/QWEN3-4B_2507_50_AGENTS 后再运行, 否则 FileNotFoundError
+        (QWEN2.5_42_7b_main 版有 _profiles_json_path() 回退, 这版没同步)
+    (b) simulate_utils.py 设 enable_thinking=True + thinking_budget=800
+        实测 Qwen3-4B-Instruct-2507 的 chat template 对 enable_thinking 参数无反应 (输出 identical)
+        → 是 no-op, 不触发思考, 但 max_tokens=900 给了 vLLM 大 budget 偶尔浪费
+        建议改 enable_thinking=False, thinking_budget=0, max_tokens=100 (~10-20% 提速)
+
+13.2 启动顺序
+  必要条件: GPU 空闲. 当前 v3 占 79.9GB/80GB, simulate_utils.py 设 gpu_memory_utilization=0.9
+            (需 72GB), 现在启动必 OOM. 等 v3 停或用另一 instance.
+
+  步骤:
+    1. cd /workspace/QWEN3-4B_2507_50_AGENTS
+    2. python simulate.py --policy_model gpt --model_type qwen --num_agents 50 --episode_length 240
+       (预计 3-6h, 产出 data/gpt-3-noperception-reflection-1-50agents-240months/)
+    3. 把 20 个 year snapshot 切成 train (y2-15) / val (y16-18) / test (y19-21)
+       (参考 /workspace/QWEN2.5_42_7b_main/data/state_bank_4b/state_bank_{train,val,test}.json 格式)
+    4. 修改 Search-R1/train_econ_grpo_qwen3_4b.sh:
+       - ++econ.state_bank_path=/workspace/QWEN3-4B_2507_50_AGENTS/data/.../state_bank_train.json
+       - ++econ.num_agents=50
+       - actor_rollout_ref.actor.ppo_mini_batch_size=600  (= 50 × 12 = 1 replica 样本量)
+       - EXPERIMENT_NAME='econagent-grpo-qwen3-4b-v4-50agents'
+    5. 可选 (先压测 1 step 再启用):
+       - ppo_micro_batch_size_per_gpu=2 → 8
+       - enable_gradient_checkpointing=true → false
+       - log_prob_micro_batch_size=16 → 32
+
+13.3 另一 instance 上的并行进度
+  据用户描述, 另一 instance 已经有 /workspace/QWEN4B_2507_50AGENTS 在跑 50-agent baseline
+  → state bank 重建耗时可能 overlap 到零
+  → 建议 v4 训练启动前从那边拷回 snapshot 数据
+
+
+十四、未解决问题 / 等待点
+===========================
+
+14.1 v3 step 28 paired 分析 (预计 2026-04-13 12:00)
+  等 14 对 same-year R_macro 数据, 做 paired t-test:
+  - Δ_mean > 2 且 p < 0.1 → 判定 v3 在学, 跑完 56 step
+  - |Δ_mean| < 1 → v3 无显著学习, 立即停 + kick v4
+  - Δ_mean < -2 → v3 退化, 立即停
+
+14.2 v4 vs v3 的决策
+  取决于 14.1 结果. 当前倾向 v4 因为:
+  - v3 的 u/wpi/gdp_r 注定 0 梯度, 最多学 2 维 reward
+  - v4 的 50 agent 能让 5 维 reward 都有梯度
+  - 时间账: v4 cold start 加速版 (若压测过) ~20h vs v3 剩余 ~36h
+
+14.3 微优化 (可与 v4 叠加)
+  - ppo_micro_batch 2→8 的 OOM 压测 (只需 1 step)
+  - grad_ckpt 关闭的 OOM 压测
+  - CUDA driver 若能升级到 >= 590 → 解锁 sleep_mode + vLLM 释放路径
 
 ================================================================================
