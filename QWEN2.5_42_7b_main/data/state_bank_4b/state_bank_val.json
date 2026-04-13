@@ -1,0 +1,83 @@
+[
+  {
+    "year_index": 16,
+    "state_group_id": "complex_y16",
+    "months_prev_year": [
+      168,
+      169,
+      170,
+      171,
+      172,
+      173,
+      174,
+      175,
+      176,
+      177,
+      178,
+      179
+    ],
+    "prev_year_mean_price": 148.01757410822105,
+    "prev_year_mean_wage": 24332.478207123175,
+    "prev_year_nominal_gdp": 28671816.80360333,
+    "prev_year_real_gdp": 26251160.643867075,
+    "snapshot_path": "snapshots/y16/y16_env.pkl",
+    "obs_path": "snapshots/y16/y16_obs.pkl",
+    "memory_state_path": "snapshots/y16/y16_memory.pkl",
+    "rng_state_path": "snapshots/y16/y16_rng.pkl",
+    "history_state_path": "snapshots/y16/y16_history.pkl"
+  },
+  {
+    "year_index": 17,
+    "state_group_id": "complex_y17",
+    "months_prev_year": [
+      180,
+      181,
+      182,
+      183,
+      184,
+      185,
+      186,
+      187,
+      188,
+      189,
+      190,
+      191
+    ],
+    "prev_year_mean_price": 153.74830905202964,
+    "prev_year_mean_wage": 24808.544712242292,
+    "prev_year_nominal_gdp": 29728631.103758052,
+    "prev_year_real_gdp": 26205625.23945447,
+    "snapshot_path": "snapshots/y17/y17_env.pkl",
+    "obs_path": "snapshots/y17/y17_obs.pkl",
+    "memory_state_path": "snapshots/y17/y17_memory.pkl",
+    "rng_state_path": "snapshots/y17/y17_rng.pkl",
+    "history_state_path": "snapshots/y17/y17_history.pkl"
+  },
+  {
+    "year_index": 18,
+    "state_group_id": "complex_y18",
+    "months_prev_year": [
+      192,
+      193,
+      194,
+      195,
+      196,
+      197,
+      198,
+      199,
+      200,
+      201,
+      202,
+      203
+    ],
+    "prev_year_mean_price": 147.599644495692,
+    "prev_year_mean_wage": 24393.97378321244,
+    "prev_year_nominal_gdp": 27357725.166529644,
+    "prev_year_real_gdp": 25112775.53355194,
+    "snapshot_path": "snapshots/y18/y18_env.pkl",
+    "obs_path": "snapshots/y18/y18_obs.pkl",
+    "memory_state_path": "snapshots/y18/y18_memory.pkl",
+    "rng_state_path": "snapshots/y18/y18_rng.pkl",
+    "history_state_path": "snapshots/y18/y18_history.pkl"
+  }
+]

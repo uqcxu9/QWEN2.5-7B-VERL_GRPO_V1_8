@@ -1,0 +1,682 @@
+================================================================================
+EconAgent GRPO 实验完整记录
+日期: 2026-04-08 ~ 2026-04-10
+作者: Chenke Xu + Claude
+================================================================================
+最后更新: 2026-04-10 04:30
+
+一、项目目标
+============
+用 Qwen3-4B-Instruct-2507 (non-thinking, 4.02B参数) 在 VERL 0.7.1 框架下做
+GRPO (Group Relative Policy Optimization) 训练。将 ACL24-EconAgent 经济仿真环境
+(100 agents, 12 months, 4 replicas) 接入 Search-R1 的 pipeline，用 environment
+step 替代 search step。
+
+核心思路: 和 Search-R1 用搜索引擎做 tool-augmented RL 一样，我们用经济仿真
+环境做 environment-augmented RL。模型生成月度经济决策(work/consumption)，
+环境返回宏观经济指标，reward 基于年度宏观表现。
+
+二、代码架构
+============
+/workspace/
+├── Search-R1/                          # 主项目 (verl fork + econ 接入)
+│   ├── verl/                           # verl 0.7.1 + econ 改动
+│   │   ├── trainer/main_ppo.py         # EconStateBankDataset 注入
+│   │   ├── trainer/ppo/ray_trainer.py  # econ 分支: rollout→reward→GRPO
+│   │   └── workers/config/actor.py     # mini_batch_size 校验绕过
+│   ├── search_r1/llm_agent/
+│   │   ├── econ_generation_manager.py  # ★ 核心: rollout + dialog + export
+│   │   └── econ_reward_adapter.py      # token-level reward 分配
+│   ├── train_econ_grpo_qwen3_4b.sh     # ★ 训练脚本
+│   └── thought.txt                     # Reward 设计论文 (LaTeX)
+│
+├── QWEN2.5_42_7b_main/                 # EconAgent 环境 + reward
+│   ├── ai_economist/                   # ACL24 经济仿真环境
+│   ├── rollout_collector.py            # prompt 构建 + action 解析 + env stats
+│   ├── reward_builder.py               # 年度 reward 计算 (13项)
+│   ├── grpo_exporter.py                # GRPO 样本导出 + tokenization
+│   ├── simulate.py                     # 环境仿真 + snapshot restore
+│   └── data/state_bank/
+│       ├── state_bank_train.json       # 训练集 (year 2-15, 14条)
+│       ├── state_bank_val.json         # 验证集 (year 16-18, 3条)
+│       └── state_bank_test.json        # 测试集 (year 19-21, 3条)
+│
+├── model/Qwen3-4B-Instruct-2507/      # 模型文件
+├── ACL24-EconAgent/                    # 原始 ACL24 代码 (参考)
+└── baselinecode.txt                    # Baseline 代码 (Qwen3-4B 版)
+
+三、Reward 设计 (thought.txt)
+==============================
+R_r = R_macro + R_micro
+
+R_macro (宏观, 按年份激活):
+  - u_center:   -1.0 * H1(z_u)          失业率 z-score Huber    (y>=1)
+  - u_guard:    -λ_u * guardrail        失业率越界 [3.5%,14.8%]  (y>=1)
+  - work_guard: -0.25 * max(0, c-0.965) 工作率反坍缩             (y>=1)
+  - gdp_r_center/guard:                  实际GDP增长              (y>=2)
+  - gdp_n_center/guard:                  名义GDP增长              (y>=2)
+  - pi_center/guard:                     价格通胀                 (y>=4)
+  - wage_pi_center/guard:                工资通胀                 (y>=4)
+
+R_micro (微观):
+  - fmt:   -2.0 * H1(p_fail/0.001)      格式错误率
+  - valid: -1.0 * H1(p_inv/0.001)       无效action率
+
+历史统计来自 US FRED 数据 (2002-2020, 19年)。
+Huber loss H1(x): |x|<=1 时 0.5*x^2, |x|>1 时 |x|-0.5。
+
+四、Pipeline 数据流
+====================
+State Bank (year N snapshot)
+  → restore_env_snapshot() → env, obs, memory
+  → clone 4 replicas (deepcopy, 独立运行)
+  → 每个 replica 跑 12 个月:
+      → build_monthly_observation() → user prompt (key-value 格式)
+      → 拼入 dialog_queue 多轮历史 + system prompt
+      → apply_chat_template → tokenize → vLLM generate
+      → batch_decode → parse_action_json() → env.step()
+      → append assistant response to dialog_queue
+      → 每 3 月: quarterly reflection via dialog4ref_queue
+  → compute_annual_reward() → R_r + breakdown (13项)
+  → _compute_group_advantages() → A_r = (R_r - μ) / (σ + ε)
+  → export_grpo_samples() → tokenized samples with loss_mask
+  → _stack_grpo_samples_to_dataproto() → DataProto batch (4800 samples)
+
+→ _compute_old_log_prob() → old_log_probs
+→ _compute_ref_log_prob() → ref_log_prob
+→ build_replica_token_level_scores() → token_level_rewards
+→ compute_advantage(adv_estimator="grpo") → advantages
+→ _update_actor() (8 mini-batches) → GRPO policy gradient update
+→ log to wandb (reward breakdown + env stats + actor metrics)
+
+五、实验历程与问题排查
+=======================
+
+--- 实验 1: 3个月, lr=1e-6, temp=1.0 ---
+问题: OOM at optimizer.step()
+原因: zombie GPU进程占10.4GB + optimizer_offload在FSDP NO_SHARD下不生效
+修复: 清理zombie + 加 torch.cuda.empty_cache() before update_actor
+
+--- 实验 2: 3个月, lr=1e-6, temp=1.0 ---
+Step 1 (base model): 格式完美 100/100, R_macro=-141
+问题: GDP proxy 用 3个月 sum 和去年 12个月比 → growth≈-75% → gdp_r=-46 爆炸
+结论: 3个月的reward无意义,必须用12个月
+
+--- 实验 3: 12个月, lr=5e-7, temp=1.0 ---
+Step 1: R_macro=-40, 格式完美
+Step 2: 模型崩溃! 输出变成自然语言, 16/100 format fail
+原因: 4800样本的梯度累积太大, 一步把模型搞坏了
+  pg_loss 从 -298 跳到正值
+
+--- 实验 4: 12个月, lr=1e-7, kl=0.01, temp=1.0 ---
+Step 1: R_macro=-40, 格式完美
+Step 2: 格式保持! work=0.98, consumption 微调 (0.70→0.66)
+问题: 所有agent输出完全一样的值, 12个月不变
+  4个replica的wpi/u_ctr等完全相同, advantage≈0
+
+--- 实验 5: 12个月, lr=1e-7, kl=0.01, temp=1.5 ---
+尝试用高temperature打破固定输出
+问题: agent间有了差异(work=0.98 vs 0.02), 但同一agent跨月还是不变
+  replica间宏观指标差异仍然很小(只有gdp_n和pi有差异)
+
+--- 排查根因 ---
+对比 baseline (ACL24 + Qwen3-4B-Instruct-2507):
+  baseline 的 agent 月度变化: work 0.96→0.98→0.98→0.96... consumption 0.44→0.60
+  GRPO 的 agent 月度变化: work=0.98 不变, consumption=0.70 不变
+
+发现3个关键差异:
+1. Baseline 用多轮对话 (dialog_queue maxlen=3), GRPO 用单轮
+   → 模型看不到前几个月的决策和经济变化, 所以每月输出一样的值
+2. Baseline 有 system prompt ("You are an economic agent..."), GRPO 没有
+3. Temperature 因代码bug没传到vLLM (_default_gen_meta 漏了temperature字段)
+4. 采样参数不同: baseline temp=0.6/top_k=20/top_p=0.95 vs GRPO temp=1.0/top_k=-1/top_p=1.0
+
+--- 实验 6: 12个月, lr=1e-6, kl=0.001, temp=0.6, mini_batch=8 ---
+修复:
+1. 加了 dialog_queue (maxlen=3) + dialog4ref_queue (maxlen=7), ACL24 风格
+2. 加了 system prompt
+3. 修了 temperature 传递
+4. 采样参数对齐 baseline (temp=0.6, top_k=20, top_p=0.95)
+5. 去掉 prompt 中冗余的 memory_state 字段 (和 dialog_queue 重复)
+6. prompt_text 存 apply_chat_template 后的完整字符串 (含截断), 确保训练对齐
+
+Step 1 结果: agent 开始月度变化! work 从 0.80→0.94→0.78, consumption 从 0.65→0.52→0.60
+格式 100/100, replica 间差异 range=7.4
+Step 2 结果: 模型崩溃! 输出随机数字/乱码, fmt=-1974
+原因: ppo_mini_batch_size=8 意味着 data.split(8) = 每块8个样本, 4800/8=600块,
+      600次 optimizer.step()! 不是分成8块而是每块8个. 有效更新=600×1e-6=6e-4, 太激进
+
+--- 实验 7: 12个月, lr=5e-7, kl=0.001, mini_batch=4800, response右填充 ---
+改动:
+1. mini_batch_size=4800 → data.split(4800) = 1块, 1次 optimizer.step()
+2. response 从左填充改为右填充 (避免 attention_mask 中间有洞)
+3. max_prompt_length 从 4342 降到 1280 (省显存)
+4. lr=5e-7 (保守)
+
+Step 1 结果: 格式 100/100, agent月度有变化, replica 间差异 range=4.3
+Step 2 结果: 格式 100/100, 没有崩溃!
+问题: pg_loss=-8.4e-7 (几乎为零), ppo_kl=0.0, clipfrac=0.0
+
+发现 on_policy 问题: verl 在 len(mini_batches)==1 and ppo_epochs==1 时
+设 on_policy=True, 用 old_log_prob = log_prob.detach() 替换预计算的 old_log_probs.
+这让 ratio=1.0 永远, 等价于 REINFORCE 而非 PPO. 但梯度本身是对的.
+
+lr=5e-7 有效性诊断 (DIAG):
+  在 dp_actor.py optimizer.step 前后对比同一层权重
+  结果: param[0] shape=[388958720] dtype=float32
+        fp32_diff_mean=5.18e-09, fp32_diff_max=9.54e-07
+        bf16_changed=33060/388958720 (0.01%)
+  结论: lr=5e-7 太小, 只有 0.01% 的 bf16 权重变了, 模型行为不变
+
+模拟测试 (FSDP NO_SHARD + MixedPrecision bf16 + AdamW, 不同 lr):
+  lr=5e-7: bf16_changed=2.0%   (小模型, 真实模型更低 0.01%)
+  lr=2e-6: bf16_changed=6.4%
+  lr=5e-6: bf16_changed=13.2%  ← 开始有效
+  lr=1e-5: bf16_changed=22.5%
+  lr=2e-5: bf16_changed=36.6%
+  lr=5e-5: bf16_changed=65.5%
+
+根因: Actor model 用 fp32 创建, FSDP MixedPrecision 的 forward 时 cast 到 bf16.
+Optimizer 在 fp32 上更新, 但更新量太小 (5e-9) 在 bf16 cast 后被 round 掉.
+vLLM 权重同步也是 fp32→bf16, 同样看不到变化.
+
+--- 实验 8: 12个月, lr=5e-6, kl=0.001, mini_batch=4800, micro_batch=4 ---
+改动:
+1. lr: 5e-7 → 5e-6 (提高 10 倍, 预期 ~13% bf16 变化)
+2. micro_batch: 1 → 4 (加速 actor update 约 3-4 倍)
+状态: 未完整运行 (因后续发现根本问题而终止)
+
+--- 实验 9: 12个月, lr=5e-6, kl=0.001, mini_batch=4800, ppo_epochs=2, CRN ---
+日期: 2026-04-10
+
+重大改动 (3项):
+1. CRN (Common Random Numbers): 在同一 GRPO group 的 4 个 replica 间对齐随机性
+   - env_rng_seed: 每个 replica 开始前 np.random.seed(同一seed),
+     确保 env 内部的价格扰动、工资扰动、agent 迭代顺序完全一致
+   - bernoulli_crn: 预生成 (12月×100人) 的 U[0,1] 表, 所有 replica 共享,
+     Bernoulli work 决策只由 policy 输出的 work_prob 差异决定
+   - 效果: replica 间 reward 差异 100% 来自 policy 决策, 不含 env 噪声
+
+2. ppo_epochs: 1 → 2
+   - 修复 on_policy=True (ratio=1.0) 问题
+   - verl 在 len(mini_batches)==1 and ppo_epochs==1 时设 on_policy=True,
+     用 log_prob.detach() 替代 old_log_probs, 导致 ratio 恒等于 1
+   - ppo_epochs=2 后: on_policy=False, epoch 2 的 ratio ≠ 1, PPO clipping 生效
+   - OOM 问题: epochs=2 在 micro_batch=4 下 backward 时 OOM (epoch 1 的
+     optimizer.step 后显存碎片化). 解决: micro_batch=4→2, epoch 间加 empty_cache()
+
+3. State Bank 更换: 7B → 4B 数据
+   - 从 5 次 Qwen3-4B baseline 运行中选择 Run 1 (总 |z|-score=3.257, 最接近 US 历史)
+   - 新 state bank: /data/state_bank_4b/, train(y2-15)/val(y16-18)/test(y19-21)
+   - 修复 numpy 版本兼容: pickle protocol 4 (numpy 2.x → numpy 1.26 兼容)
+   - 修复 main_ppo.py: val_dataset 之前和 train 用同一文件, 现在自动检测 _val.json
+
+其他修复:
+- VLLM_ATTENTION_BACKEND: XFORMERS → FLASH_ATTN (xformers paged KV 要求 block 被 256 整除)
+- vLLM supervisor: vast.ai 平台持续重启 vLLM serve DeepSeek, 抢 GPU 74GB → 禁用 supervisor
+
+Step 1 结果 (year=4, base model):
+  group_rewards: [-33.7, -33.2, -31.9, -28.9], advantage 范围 2.6
+  CRN 生效: u_ctr/gdp_r/wpi/wpiG 在 4 replica 间完全一致
+  差异只来自 pi (-5.9~-8.2) 和 gdp_n (-0.2~-1.2) → 由 consumption 驱动
+  格式: 100/100, fmt=0, valid=0
+  pg_loss=0.013, grad_norm=1.74, ppo_kl=0.112, clipfrac=0.014
+
+Step 2 结果 (year=11):
+  group_rewards: [-38.3, -37.5, -38.8, -37.9], advantage 范围 2.7
+  wpi=-21.445 (比 year=4 的 -14.775 更差 → year 不同, 经济基线不同)
+  pg_loss=0.007, grad_norm=1.33, ppo_kl=0.052, clipfrac=0.008, kl_loss=0.536
+
+关键发现:
+  bf16_changed = 0.07% (epoch 1) + 0.09% (epoch 2) = 总计 ~0.16%
+  EXPERIMENT_LOG 的模拟预测 lr=5e-6 应有 13.2% bf16 变化, 但那是用随机梯度模拟的
+  真实 GRPO 梯度因 advantage 组内归一化 (均值≈0) 而大幅互相抵消
+  更新量仍然太小, 模型行为基本不变
+
+根因分析:
+  1. loss_agg_mode="token-mean": 4800 样本的梯度全部平均
+  2. GRPO advantage 均值=0: 正负方向梯度互相抵消, 残差极小
+  3. mini_batch=4800 = 全量 batch: data.split(4800)=1块, 抵消最严重
+  4. 按 (replica_uid, agent_id, month) 排序后, 同一 replica 的 1200 样本连续排列
+     如果 split 成更小的 mini-batch, 每块来自单一 replica → 梯度不抵消
+  5. AdamW step 1 更新 ≈ ±lr = ±5e-6, 对 |param|>0.001 的参数在 bf16 下不可见
+
+--- 实验 10 (当前): 12个月, lr=1e-5, kl=0.001, mini_batch=600, ppo_epochs=2, CRN ---
+日期: 2026-04-10
+
+改动:
+1. ppo_mini_batch_size: 4800 → 600
+   - data.split(600) = 8 个 mini-batch, 每个 mini-batch 来自同一 replica
+   - 样本按 (replica_uid, agent_id, month) 排序, split 不 shuffle
+   - 每个 mini-batch 600 样本, advantage 方向一致, 不互相抵消
+   - 8 mini-batch × 2 epochs = 16 次 optimizer.step (之前: 1×2=2 次)
+
+2. lr: 5e-6 → 1e-5
+
+3. 对比实验 6 (崩溃) 的安全性:
+   实验 6: mini_batch=8, 600次step, 8样本/step, lr=1e-6 → max_total=6e-4, 崩溃
+   实验 10: mini_batch=600, 16次step, 600样本/step, lr=1e-5 → max_total=1.6e-4
+   - 步数少 37 倍 (16 vs 600)
+   - 每步梯度稳定 75 倍 (600 vs 8 样本)
+   - max_total_update 只有实验 6 的 1/4
+   - PPO clipping + KL 正则化 + CRN 都在保护
+
+Step 1 结果 (year=4, base model):
+  group_rewards: [-33.9, -33.1, -32.4, -33.2], advantage: [-1.40, 0.06, 1.43, -0.09]
+  CRN 生效: u_ctr/gdp_r/wpi 在 4 replica 间完全一致
+  格式: 100/100, fmt=0, valid=0
+  16 次 DIAG (8 mini-batch × 2 epochs):
+    Epoch 1: bf16_changed = 0.09%, 0.12%, 0.09%, 0.11%, 0.09%, 0.12%, 0.08%, 0.08%
+    Epoch 2: bf16_changed = 0.07%, 0.07%, 0.06%, 0.06%, 0.06%, 0.06%, 0.06%, 0.05%
+  训练指标 (16 个 mini-batch 累计):
+    pg_loss=0.894, grad_norm=1.67, ppo_kl=0.862, clipfrac=0.067, kl_loss=17.17
+  对比实验 9 (mini_batch=4800):
+    pg_loss: 0.013 → 0.894 (69倍), ppo_kl: 0.112 → 0.862 (8倍)
+    梯度抵消问题已解决, 但 ppo_kl=0.862 偏高
+
+Step 2 结果 (year=11): 模型崩溃!
+  模型输出退化为 {"work": 0.99} — 缺少 consumption 键 (14 chars)
+  所有 100 agent × 12 月 × 4 replica 输出完全相同
+  parse_action_json 判定缺键 → invalid_action_count=1200/1200 → valid=-999.5
+  fallback 到 {work:1.0, cons:0.5} → 4 replica reward 完全一致 → advantage=0
+  group_rewards: [-1034.0, -1034.0, -1034.0, -1034.0]
+
+崩溃原因:
+  16 次 optimizer.step 每次沿单一 replica 方向完整更新, 累积偏移过大
+  ppo_kl=0.862 (正常范围 0.01-0.2) 说明一步就把 policy 推离 ref model 太远
+
+--- 实验 11: 12个月, lr=1e-5, kl=0.001, mini_batch=1200, ppo_epochs=2, CRN ---
+日期: 2026-04-10
+wandb run: run-20260410_053632-9b97ft0p (experiment_name: econagent-grpo-qwen3-4b-v1)
+
+改动:
+1. ppo_mini_batch_size: 600 → 1200
+   - data.split(1200) = 4 个 mini-batch, 每个 = 1 个完整 replica (1200 样本)
+   - 4 mini-batch × 2 epochs = 8 次 optimizer.step (之前: 16 次)
+   - 更符合 reward 的定义单位 (replica 级别的年度 reward)
+2. lr=1e-5 不动 — 先减 step 次数定位问题, 如果还崩再降 lr
+3. loss_agg_mode 继续默认 token-mean (短 response ~12 token 在 token-mean 下被稀释)
+
+对比:
+  实验 10 (崩): mini_batch=600, 16 steps → ppo_kl=0.862, step 2 崩溃
+  实验 11:     mini_batch=1200, 8 steps → 预期 ppo_kl 减半
+  实验 9 (弱): mini_batch=4800, 2 steps → ppo_kl=0.112, 梯度抵消
+
+Step 1 结果 (year=4):
+  group_rewards: [-33.7, -33.2, -31.9, -28.9], advantage 范围 2.6
+  格式 100/100, pg_loss=0.013, grad_norm=1.74, ppo_kl=0.112, clipfrac=0.014
+Step 2 结果 (year=11):
+  group_rewards: [-38.3, -37.5, -38.8, -37.9], advantage 范围 2.7
+  wpi=-21.445 (year 不同, 经济基线不同)
+  pg_loss=0.007, grad_norm=1.33, ppo_kl=0.052, clipfrac=0.008, kl_loss=0.536
+
+稳定但弱:
+  bf16_changed = 0.07% (epoch 1) + 0.09% (epoch 2)
+  真实 GRPO 梯度因 advantage 组内归一化 (均值≈0) 大幅互相抵消
+  模型行为基本不变, 99.9% 的参数对下一步 rollout 无影响
+结论: 不崩但训练信号极弱. 改 loss_agg_mode (→实验 12).
+
+
+--- 实验 12: 12个月, lr=1e-5, kl=0.001, mini_batch=1200, ppo_epochs=2, CRN + seq-mean-token-mean ---
+日期: 2026-04-12
+wandb run: run-20260412_040838 (experiment_name: econagent-grpo-qwen3-4b-v2-seqmean)
+
+动机:
+  实验 11 弱的根因 = 4800 样本 token-mean 下, 短 response (实测 ~12 token,
+  不是之前以为的 50) 每 token 权重 1/N_token 被稀释. 按 thought.txt §Stage 9
+  公式 L_r = (1/N_agent)(1/12)(1/|Y|)ΣΣΣ ℓ 应该做 seq-mean-token-mean.
+
+  论文 vs 代码: thought.txt 说三级 mean, 实际 verl 默认 token-mean.
+  改 1 行 config 即可对齐: actor_rollout_ref.actor.loss_agg_mode=seq-mean-token-mean
+  (verl core_algos.py:1185-1193 已实现, 无需改代码)
+
+前提条件 (读代码确认):
+  - 每个 sample = 1 个 (replica, agent, month) 序列 ✓ grpo_exporter.py:132
+  - 样本按 (replica_uid, agent_id, month) 排序 ✓ econ_generation_manager.py:696
+  - dp_actor.py:548 data.split(mini_batch) 不 shuffle ✓
+  - mini_batch=1200 = 100 agent × 12 月 = 1 个完整 replica ✓
+
+理论缩放 (token-mean → seq-mean):
+  token-mean = Σℓ / (N_seq · response_len_avg)
+  seq-mean   = (1/N_seq) Σ_seq [(1/|Y_seq|) Σ_t ℓ_t]
+  放大比 = response_len_avg ≈ 12 倍
+
+Step 1 实测 (year=4, base model):
+  group_rewards: [-31.65, -33.96, -34.54, -31.38], advantage range=2.28
+  格式 100/100, R_micro=0
+  pg_loss=0.410, ppo_kl=1.016, kl_loss=8.47, clipfrac=0.079, grad_norm=1.10
+  bf16_changed: 0.10-0.15%
+
+  实测放大 vs 预测:
+    pg_loss: 0.013 → 0.410 = 31.5× (比线性预测 12× 大 2.6×)
+    ppo_kl:  0.112 → 1.016 = 9×
+    kl_loss: 0.536 → 8.47  = 15.8×
+    bf16:    0.08%  → 0.12% = 1.5×
+  超线性放大的原因: short response 在 seq-mean 下 ratio 偏离更快,
+  PPO 非线性 ratio×advantage×clipping 相互作用
+
+Step 2 (year=11) rollout 存活:
+  group_rewards: [-55.25, -53.77, -61.67, -56.46]  (vs 实验 11 同 year: -38 量级)
+  wpi=-21.445 (与实验 11 同 year 一致, 环境基线, 非 policy)
+  格式 100/100, R_micro=0 仍在
+  advantage [0.52, 1.01, -1.64, 0.11] 有差异
+  但 pg_loss=0.016, ppo_kl=0.0066 突降 -- 警报
+  rep=0 m=0: work_prob std=0.140, **cons std=0.000** -- cons 已坍缩!
+
+Step 3 (year=15): pg_loss=0.0016, ppo_kl=0.0021 -- 更假性"收敛"
+  rep=0 m=0: work std=0.017 (接近 0), cons std=0 -- work 也快死了
+
+Step 4 (year=9): group_rewards 全部 -32.952 相同, advantage=[0,0,0,0]
+  rep=0 m=0: work std=0.000, cons std=0.000
+  100 agent × 12 月 × 4 replica 全输出 {"work":0.80,"consumption":0.30}
+  ** 完全熵坍缩: 格式没崩 (R_micro=0 仍正确), 但策略熵 = 0 **
+
+与实验 10 崩溃形态对比:
+  实验 10 (lr=1e-5, token-mean, 16 step): {"work":0.99} 缺 consumption → 格式崩
+  实验 12 (lr=1e-5, seq-mean, 8 step):    {"work":0.80,"consumption":0.30} 固定 → 熵崩
+  同根因: PPO trust region 过冲. step 1 ppo_kl=1.016 远超稳定区 (<0.2).
+
+结论: seq-mean 正确, lr 太大. lr 要按 seq-mean 放大比缩小 → 实验 13.
+
+
+--- 实验 13 (进行中, 2026-04-12 起): lr=1e-6, kl=0.001, mini_batch=1200, ppo_epochs=2, CRN + seq-mean-token-mean ---
+日期: 2026-04-12
+wandb run: econagent-grpo-qwen3-4b-v3-seqmean-lr1e6
+
+改动:
+1. lr: 1e-5 → 1e-6 (降 10 倍, 补偿 seq-mean 的 ~12 倍放大)
+2. loss_agg_mode=seq-mean-token-mean 保留 (实验 12 已证明思路对)
+3. 其他配置不动
+
+理论: lr/12 ≈ 8e-7 严格等效实验 11 的 effective lr. 取 1e-6 保留稍多 headroom.
+
+Step 1 实测 (year=4, base model):
+  group_rewards: [-31.48, -35.16, -35.51, -32.15], advantage range=4.03
+  格式 100/100, R_micro=0
+  pg_loss=0.020, ppo_kl=0.00481, kl_loss=0.096, clipfrac=0.008, grad_norm=3.52
+  bf16_changed=0.01%
+
+  vs 实验 12 step 1 (lr=1e-5):
+    pg_loss:  0.410 → 0.020 (1/20, 比 lr 缩放 10× 还低, PPO 非线性)
+    ppo_kl:   1.016 → 0.005 (1/200)
+    kl_loss:  8.47  → 0.10  (1/85)
+    bf16:     0.12% → 0.01% (1/12, 与 lr 缩放严格一致)
+
+Step 2 (year=11): pg_loss=0.011, ppo_kl=0.006, kl_loss=0.13, clipfrac=0.009
+  group_rewards: [-40.66, -42.65, -42.76, -42.52] (vs 实验 11 同 year: -38 量级, 略差)
+  rep=0 m=0 post-step1: work 0.868/0.140, cons 0.370/0.091 (cons mean +0.095, std 健康)
+  **关键对比**: 实验 12 同处 cons std = 0.000 一击死, v3 cons std = 0.091 存活
+
+Step 3 (year=15): pg_loss=0.011, ppo_kl=0.002, kl_loss=0.237 (峰值), grad_norm=2.76
+  group_rewards: [-20.24, -19.60, -19.20, -19.44]
+  rep=0 m=0 post-step2: work 0.848/0.225, cons 0.368/0.135 (work_std 持续上升)
+
+Step 4 (year=9): pg_loss=0.011, ppo_kl=0.0012, kl_loss=0.207, grad_norm=2.62
+  group_rewards: [-23.80, -25.96, -20.48, -23.78]
+  rep=0 m=0 post-step3: work 0.837/0.193, cons 0.352/0.106
+
+Step 5 (year=13): pg_loss=0.010, ppo_kl=0.0009, kl_loss=0.182, grad_norm=3.15
+  group_rewards: [-54.04, -55.17, -54.11, -55.20] (year 13 基线差)
+  rep=0 m=0 post-step4: work **0.762**/0.235, cons 0.379/0.103
+  (work mean 一跳 -0.075, 然后 step 5 update 又拉回到 0.863)
+
+Step 6 (year=2, rollout 完成, actor 进行中):
+  group_rewards: [-7.71, -7.48, -7.07, -6.99] (year=2 只有 u/GDP 激活, 无 inflation)
+  rep=0 m=0 post-step5: work 0.863/0.134, cons 0.334/0.076
+
+5h15m 进度总结 (截至 2026-04-12 12:39):
+  - 5 完整 step + step 6 rollout 完成
+  - Rate ~63 min/step, 56 step 全程约 58h
+  - ppo_kl 单调下降 0.005 → 0.001 (ratio 越来越接近 1)
+  - kl_loss 在 step 3 达峰 0.237 后回落 0.207 → 0.182 (策略收敛)
+  - pg_loss 稳定 0.010-0.020 (梯度信号没死)
+  - grad_norm 稳定 2.62-3.52
+  - bf16_changed 稳定 0.01% (vs 实验 11 的 0.07%, 但 policy 实际在变)
+  - 288 个 "100/100 responses contain braces" 记录: 全程格式 100% 通过
+  - fmt/valid 24 次检查全为 -0.000
+  - policy 演化: cons mean 0.275 → 0.35 区间稳定, work mean 0.876 → 0.84 区间震荡
+  - 熵: work_std 0.13-0.23 区间浮动, cons_std 0.08-0.14 区间, 均 > 0.05 无坍缩
+
+状态: 正在运行
+尚未证明 "reward 真的在改善" — 6 个 step 全是不同 year (4,11,15,9,13,2),
+同 year 首次重访预计 step 12-15 (~8 小时后, 约 2026-04-12 20:00)
+
+六、所有代码改动清单
+=====================
+
+6.1 econ_generation_manager.py (核心改动)
+------------------------------------------
+- 多轮对话: dialog_queue (deque maxlen=3) + dialog4ref_queue (deque maxlen=7)
+  per-agent per-replica, 每月 append user/assistant
+- _build_gen_dataproto_from_dialogs(): 新方法, 接受多轮 message list
+- _pad_and_stack_rows(): 抽象共用 padding 逻辑
+- System prompt: _ECON_SYSTEM_PROMPT (经济agent角色) + _REFL_SYS (反思角色)
+  固定 prepend 在 messages 前, 不进 dialog_queue
+- prompt_text 对齐: 存 apply_chat_template 后的完整字符串 (含截断)
+  确保训练重算 logprob 时和 rollout 一致
+- _default_gen_meta(): 正确传 temperature/top_p/top_k 到 vLLM
+- 季度反思: 用 dialog4ref_queue 作为上下文, ACL24 拼接逻辑
+- 季度判断: (t+1)%3==0 与原版一致
+- export_grpo_samples: align_rollout_chat_template=False (避免双重包裹)
+- Debug print: response样例 + format率 + reward breakdown (13项全部)
+- CRN: run_econ_year_loop 在 replica 循环前用独立 RandomState 预生成
+  bernoulli_crn (12×100 U[0,1] 表) + env_rng_seed, 传入 run_single_replica_year
+- env RNG 隔离: run_single_replica_year 开头 np.random.seed(env_rng_seed)
+- 诊断日志: [econ-diag] 每月打印 work_prob/cons 均值、labor_binary、demand/supply
+
+6.2 rollout_collector.py (prompt精简 + CRN)
+----------------------------------------------
+- 移除 prompt 中的 decision_context (7条说明, 127 tokens) → 移到 system prompt
+- 移除 last_month_action_raw, recent_3m_summary, quarter_reflection_summary
+  → 由 dialog_queue 多轮历史提供, 避免冗余
+- 保留 tax_line + 简短格式提醒
+- 单个 user prompt 从 ~545 tokens 缩到 ~324 tokens
+- convert_raw_action_to_env_action: 新增 bernoulli_u 参数 (Optional[float])
+  传入时用该值做 Bernoulli 判定 (CRN 模式), 不传时 fallback 到 np.random.uniform()
+
+6.3 ray_trainer.py (训练流程)
+------------------------------
+- Checkpoint saving: econ 分支现在保存模型 (之前 continue 跳过了)
+- Validation: econ 分支现在做验证
+- Env stats: wandb 记录所有 replica 平均值 (之前只取 replica 0)
+- torch.cuda.empty_cache(): actor update 前释放缓存显存
+
+6.4 actor.py (校验绕过)
+-------------------------
+- ppo_mini_batch_size > train_batch_size: raise → warning
+  econ 模式下 train_batch_size=1 但实际样本 4800+
+
+6.5 dp_actor.py (训练循环)
+----------------------------
+- ppo_epochs 循环间加 torch.cuda.empty_cache() (防 epoch 1 optimizer.step 后碎片化导致 OOM)
+
+6.6 main_ppo.py (数据集)
+--------------------------
+- val_dataset 自动检测: 当 train 路径以 _train.json 结尾时, 自动查找同目录 _val.json
+  之前 val_dataset 和 train_dataset 用同一文件 (无 train/val 分离)
+
+6.7 State Bank 4B (新)
+------------------------
+从 5 次 Qwen3-4B baseline 运行中选择最接近 US 历史的 Run 1:
+  选择标准: 4 个宏观指标 (失业率/GDP增长/价格通胀/工资通胀) 与 US FRED 2002-2020
+            数据的 z-score 偏差之和, Run 1 = 3.257 (最低)
+  数据来源: github.com/uqcxu9/qwen3_4b_instruct_2507_base
+  state_bank_4b/: 20 条记录, train(y2-15)/val(y16-18)/test(y19-21)
+  snapshot 格式: pickle protocol 4 (兼容 verl venv 的 numpy 1.26)
+  旧 7B state_bank 保留但不再被训练脚本引用
+
+6.8 train_econ_grpo_qwen3_4b.sh (实验 13 配置)
+---------------------------------------------
+  actor_rollout_ref.actor.optim.lr=1e-6  (原 1e-5)
+  actor_rollout_ref.actor.loss_agg_mode=seq-mean-token-mean  (原默认 token-mean)
+  actor_rollout_ref.actor.ppo_mini_batch_size=1200
+  actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=2
+  actor_rollout_ref.actor.ppo_epochs=2
+  actor_rollout_ref.actor.kl_loss_coef=0.001
+  actor_rollout_ref.actor.kl_loss_type=low_var_kl
+  EXPERIMENT_NAME='econagent-grpo-qwen3-4b-v3-seqmean-lr1e6'
+  (启动前必须 source /workspace/venvs/verl_latest/bin/activate 否则 ray 起错 python)
+
+七、当前训练配置 (实验 13, 2026-04-12)
+=========================
+模型:          Qwen3-4B-Instruct-2507 (non-thinking)
+框架:          verl 0.7.1 GRPO, off-policy (ppo_epochs=2, ratio≠1, clipping 生效)
+硬件:          单卡 H100 80GB
+vLLM:          gpu_memory_utilization=0.18, enforce_eager=true, FLASH_ATTN backend
+
+lr:            1e-6   (实验 11-12 是 1e-5, 配合 seq-mean 需要缩 10 倍)
+kl_loss_coef:  0.001
+kl_loss_type:  low_var_kl
+mini_batch:    1200 (4次 optimizer.step/epoch, 8次/training_step)
+micro_batch:   2
+ppo_epochs:    2
+loss_agg_mode: seq-mean-token-mean  (实验 11 及之前是 token-mean)
+
+temperature:   0.6 (与baseline一致)
+top_k:         20
+top_p:         0.95
+
+num_agents:    100
+num_months:    12
+replicas:      4
+state_bank:    state_bank_4b train split (14 years, year 2-15)
+total_epochs:  4 (56 training steps)
+
+CRN:           enabled (bernoulli_crn + env_rng_seed per GRPO group)
+
+rollout_prompt_length: 1216
+max_response_length:   64
+max_model_len:         1536
+max_start_length:      1216
+max_obs_length:        1216
+max_prompt_length:     1280
+
+save_freq:     20
+test_freq:     9999 (基本不做validation)
+logger:        wandb (EconAgent-GRPO project)
+
+八、审计确认的正确性
+=====================
+- reward_builder.py: 全部13项reward公式与thought.txt完全一致 ✓
+- GDP proxy 口径: supply_homogeneous * price, 与原版 EconAgent 一致 ✓
+- parse_action_json: work/consumption [0,1] on 0.02 grid ✓
+- grpo_exporter: loss_mask 只优化 response tokens ✓
+- GRPO advantage: compute_grpo_outcome_advantage 按 uid 分组归一化 ✓
+- 多轮对话: 无未来信息泄漏 (prompt→generate→step 顺序严格) ✓
+- Replica 独立性: deepcopy env/obs/memory, per-agent per-replica queue ✓
+- Prompt-training 对齐: prompt_text 存截断后解码的字符串 ✓
+- Token 边界: 分开 encode 和联合 encode 结果一致 ✓
+- CRN: env RNG 每步消耗固定数量随机数 (不随 action 变), seed 对齐有效 ✓
+- CRN: Bernoulli 表按 (month, agent) 索引, 所有 replica 共享 ✓
+- State bank 4B: restore_env_snapshot 在 verl venv 下验证通过 ✓
+- train/val/test split: 无重叠, train=[y2-15], val=[y16-18], test=[y19-21] ✓
+- val_dataset: 自动检测 _val.json, 不再与 train 共享同一文件 ✓
+
+九、已知限制与后续计划
+=======================
+1. State bank train/val/test 来自同一条冷启动轨迹 (Run 1), 不算真正 OOD
+2. dialog_queue maxlen=3 可能太短, 可做消融 (5, 7, ...)
+3. 导师建议: 结构化 memory 模块替代/补充原始对话历史 (方向B)
+4. 层级 loss 聚合: 实验 13 起切换到 seq-mean-token-mean
+   - 对应 thought.txt §Stage 9 公式中 replica 内部的三级 mean (token→month→agent)
+   - replica 维度的 "平均" 通过跨 mini_batch 的顺序梯度步累积, 非单步 batch mean
+   - 严格匹配论文公式需 mini_batch=4800 (全量, 但会回到 advantage 抵消问题)
+   - 当前折中: 保留层级 mean + 顺序梯度步, 论文 Stage 2/9 需同步修订
+5. wpi/u_ctr/gdp_r 在 CRN 下 replica 间完全一致 (已确认原因):
+   - work 概率经 Bernoulli 二值化 + 100 agent 均值后, 个体差异被抹平
+   - 工资更新用同一 env RNG draw, 仅上界 (max_change_rate) 不同, 100 agent 均值后差异极小
+   - GRPO 对这些指标几乎无梯度信号, 训练主要通过 consumption → demand → price 通道
+   - 如果多步训练后 pi/gdp_n 改善但 wpi/u_ctr 不动, 考虑减少 agent 数量或改 work 通道设计
+6. on_policy 已修复 (ppo_epochs=2), ratio≠1, clipfrac>0
+7. env RNG 已隔离 (CRN), replica 差异纯粹来自 policy
+8. bf16 精度问题: 模型参数 p50=0.0156, bf16 最小变化=|p|/128
+   lr=5e-6 时 Adam 更新 ≈ ±5e-6, 仅 ~0.07% 参数在 bf16 下可见变化
+   真实 GRPO 梯度比随机梯度小 ~37 倍 (advantage 互相抵消)
+   mini_batch=600 通过避免全量平均来保留单 replica 梯度方向
+9. prompt roundtrip 编码: encode→truncate→decode→encode 在截断边界可能不一致, 建议加 assert
+
+十一、关键发现与经验教训
+========================
+1. 多轮对话是必须的: 单轮 prompt 下模型 12 个月输出完全一样的值
+2. System prompt 是必须的: 与 baseline 对齐, 告诉模型角色和输出格式
+3. Temperature 传递 bug: _default_gen_meta 原来漏了 temperature 字段
+4. ppo_mini_batch_size 的语义: data.split(N) 是每块 N 个样本, 不是分 N 块
+   mini_batch=8 → 600块 → 600次step (崩了, 实验6)
+   mini_batch=4800 → 1块 → 1次step (梯度全抵消, 实验7-9)
+   mini_batch=600 → 8块 → 每块来自同一replica → 梯度不抵消 (实验10)
+5. FSDP MixedPrecision 的 bf16 精度陷阱: fp32 optimizer 更新在 bf16 forward
+   时被 round 掉. 实测 bf16 变化率:
+   lr=5e-7: 0.01%, lr=5e-6: 0.07%, 均远低于模拟预测
+   真实 GRPO 梯度因 advantage 抵消比随机梯度小 ~37 倍
+   验证方法 (dp_actor.py:683-691): clone param[0] 前后对比,
+   fp32_diff 是真实更新量, bf16_changed 是 cast 后 forward/rollout 能感知的比例
+6. 3个月 GDP 无意义: 3个月 sum vs 去年12个月 sum → growth≈-75% → GDP reward 爆炸
+7. Prompt 冗余: memory_state 的 recent_3m_summary 和 dialog_queue 信息重复
+8. GRPO 方差来源问题: 100 agent 经济体中, 个体 action 差异被 aggregate 抹平,
+   wpi/u_ctr/gdp_r 在 replica 间完全一致; 只有 price/nominal_gdp 通过
+   consumption → demand → max_change_rate → price 链路有方差
+9. CRN 的作用不是增加方差, 而是让现有方差纯粹来自 policy:
+   之前: reward 方差 = env 噪声 + policy 差异 (学的是噪声)
+   现在: reward 方差 = 纯 policy 差异 (学的是策略)
+10. mini_batch < 全量 + 不 shuffle + 按 replica 排序 = 每次 step 梯度来自单一 replica,
+    避免了 advantage 正负抵消, 是解决"大 batch 梯度消失"的正确策略
+11. ppo_epochs=2 的 OOM: optimizer.step 后显存碎片化, 第二轮 epoch backward 时分配
+    连续内存失败. 解决: micro_batch 降低 + epoch 间 empty_cache()
+12. numpy pickle 兼容: 系统 numpy 2.x 序列化的 pickle 在 verl venv (numpy 1.26) 下
+    报 ModuleNotFoundError: numpy._core. 解决: protocol 4 重新序列化
+13. Ray worker python 环境: verl cluster 必须从 verl venv 启动 (source venv 后跑脚本).
+    否则新 ray cluster 会用系统 /usr/bin/python3, 缺 tensordict 等依赖 →
+    "No module named 'tensordict'" 错. 重启前先 ray stop --force + pkill ray::
+14. loss_agg_mode 切换的代价 (实验 11 vs 12, 同 lr=1e-5):
+    token-mean    : pg_loss=0.013, ppo_kl=0.112, bf16=0.08% → 稳定但弱
+    seq-mean-t-m  : pg_loss=0.410, ppo_kl=1.016, bf16=0.12% → step 1 即坍缩
+    放大比 ≈ response_len ≈ 12 倍 (理论), 实测 pg_loss 放大 31×, ppo_kl 放大 9×
+    超线性来自 PPO ratio×advantage×clipping 的非线性相互作用
+15. 熵坍缩 vs 格式崩坏是同根因的两种形态:
+    实验 10 (token-mean, 16 step, lr=1e-5): {"work":0.99} 缺 cons → 格式崩, R_micro=-999
+    实验 12 (seq-mean,  8 step, lr=1e-5): {"work":0.80,"cons":0.30} 固定 → 熵崩, R_micro=0
+    表型不同但本质都是 PPO trust region 过冲, ppo_kl>1 是早期警报
+16. 熵坍缩是渐进的 (实验 12 实测):
+    step 1 update 后: cons std 0.107→0.000 (一击死 cons)
+    step 2 update 后: work std 0.140→0.017 (work 快死)
+    step 3 update 后: work std 0.017→0.000 (完全死)
+    step 4: group_rewards 全部 -32.952 相同, advantage=[0,0,0,0], 再无梯度信号
+    单看 pg_loss/ppo_kl 会迷惑: 坍缩后 pg_loss 反而假性"收敛" (ratio≈1)
+    必须看 rep=0 m=0 的 work_std / cons_std 才能判断策略是否还活着
+17. seq-mean 放大比的 lr 补偿公式 (实验 12 → 13 验证):
+    新 lr = 原 lr / response_len_avg
+    实测 response_len ≈ 12 token, 所以 lr=1e-5 → 1e-6
+    结果: pg_loss 0.410→0.020, ppo_kl 1.016→0.005, bf16 0.12%→0.01%
+    policy 在 cons mean 0.275→0.35 移动, 熵 std>0.05 全程保持, 格式 100/100
+18. R_macro 跨 year 不可比: state bank train 14 year (y2-15) 环境基线差异巨大,
+    year 2 (无 inflation 激活) R_macro ≈ -7, year 13 ≈ -54. 要判断 "reward 改善"
+    必须等同 year 重访 (首次出现在 epoch 2 的首个 step, 约 step 12-15)
+
+十二、W&B 监控指标
+==================
+econ_reward/u_center          失业率 z-score 惩罚
+econ_reward/u_guard           失业率越界惩罚
+econ_reward/work_guard        工作率反坍缩
+econ_reward/real_gdp_center   实际 GDP 增长
+econ_reward/real_gdp_guard    实际 GDP 越界
+econ_reward/nominal_gdp_center 名义 GDP 增长
+econ_reward/nominal_gdp_guard 名义 GDP 越界
+econ_reward/pi_center         价格通胀
+econ_reward/pi_guard          价格通胀越界
+econ_reward/wage_pi_center    工资通胀
+econ_reward/wage_pi_guard     工资通胀越界
+econ_reward/fmt               格式错误惩罚
+econ_reward/valid             无效 action 惩罚
+econ_reward/R_macro           宏观 reward 总和
+econ_reward/R_micro           微观 reward 总和
+econ_env/format_fail_count    格式失败次数 (均值)
+econ_env/invalid_action_count 无效 action 次数 (均值)
+econ_env/out_of_range_count   越界次数 (均值)
+econ_env/fallback_action_count 回退次数 (均值)
+actor/pg_loss                 policy gradient loss
+actor/kl_loss                 KL 散度 loss
+actor/entropy_loss            策略熵
+actor/grad_norm               梯度范数
+critic/score/mean             总 reward 均值
+
+================================================================================

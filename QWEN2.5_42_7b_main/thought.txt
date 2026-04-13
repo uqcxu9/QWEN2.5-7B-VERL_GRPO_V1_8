@@ -1,0 +1,640 @@
+\documentclass{article}
+\usepackage{amsmath, amssymb, booktabs, geometry, array}
+\geometry{margin=1in}
+
+\title{EconAgent GRPO: Reward Design}
+\author{Chenke Xu}
+\date{March 2026}
+
+\begin{document}
+\maketitle
+
+\section{Reward Function}
+We train a shared policy via GRPO on economy-year rollouts.
+For each initial economy state, GRPO samples multiple replicas.
+Each replica $r$ produces one annual scalar reward shared by all
+100 agents in that economy-year rollout.
+
+\begin{equation}
+R_{r}
+=
+R^{\mathrm{macro}}_{r}
++
+R^{\mathrm{micro}}_{r}
+\end{equation}
+
+\begin{multline}
+R^{\mathrm{macro}}_{r}
+=
+r^{u,\mathrm{center}}_{r}
++r^{u,\mathrm{guard}}_{r}
++r^{\mathrm{work}}_{r} \\
++\mathbf{1}[y \geq 2]
+\!\left(
+r^{g^r,\mathrm{center}}_{r}
++r^{g^r,\mathrm{guard}}_{r}
++r^{g^n,\mathrm{center}}_{r}
++r^{g^n,\mathrm{guard}}_{r}
+\right) \\
++\mathbf{1}[y \geq 4]
+\!\left(
+r^{\pi,\mathrm{center}}_{r}
++r^{\pi,\mathrm{guard}}_{r}
++r^{\pi^w,\mathrm{center}}_{r}
++r^{\pi^w,\mathrm{guard}}_{r}
+\right)
+\end{multline}
+
+\noindent where:
+\begin{itemize}
+    \item $r$: replica index; one of the four rollouts sampled from the same initial economy state
+    \item $y$: year index of the current training episode
+    \item $r^{u,\mathrm{center}}_{r}$: z-score Huber penalty on annual unemployment rate
+    \item $r^{u,\mathrm{guard}}_{r}$: range penalty when unemployment exits the US historical interval
+    \item $r^{g^r,\mathrm{center}}_{r}$, $r^{g^n,\mathrm{center}}_{r}$: z-score Huber penalties on real and nominal GDP growth rates; active from $y \geq 2$
+    \item $r^{g^r,\mathrm{guard}}_{r}$, $r^{g^n,\mathrm{guard}}_{r}$: range penalties on GDP growth rates; active from $y \geq 2$
+    \item $r^{\pi,\mathrm{center}}_{r}$, $r^{\pi^w,\mathrm{center}}_{r}$: z-score Huber penalties on price and wage inflation; active from $y \geq 4$
+    \item $r^{\pi,\mathrm{guard}}_{r}$, $r^{\pi^w,\mathrm{guard}}_{r}$: range penalties on price and wage inflation; active from $y \geq 4$
+    \item $r^{\mathrm{work}}_{r}$: one-sided barrier against near-complete work-rate collapse; always active
+\end{itemize}
+
+\begin{equation}
+R^{\mathrm{micro}}_{r}
+=
+r^{\mathrm{fmt}}_{r}
++
+r^{\mathrm{valid}}_{r}
+\end{equation}
+
+\noindent Here, $r$ indexes one of the GRPO replicas sampled from the same
+initial economy state. All 100 agents within the same replica share the
+same annual reward.
+
+\noindent We use the Huber loss throughout.
+Small errors are penalised quadratically and large errors linearly,
+preventing extreme values from dominating the training signal:
+
+\begin{equation}
+H_\delta(x) = \begin{cases}
+  \tfrac{1}{2}x^2 & |x| \leq \delta \\
+  \delta(|x| - \tfrac{1}{2}\delta) & |x| > \delta
+\end{cases}
+\end{equation}
+
+\noindent For macroeconomic terms, we first standardise each annual indicator
+by the historical mean and standard deviation of the corresponding US series,
+and then apply $H_1(\cdot)$ to the resulting z-score.
+For microeconomic terms, we normalise each failure rate by a tolerance
+parameter and then apply $H_1(\cdot)$.
+For macroeconomic variables, we additionally impose range-based guardrail penalties
+when the simulated value falls outside a predefined plausible interval.
+These guardrails serve only as stability constraints and do not replace the
+distribution-anchored z-score terms.
+
+\section{Macroeconomic Reward}
+
+\subsection{Unemployment}
+
+Let $u_r$ denote the annual unemployment rate of replica $r$.
+Instead of matching a specific historical year, we anchor the simulation
+to the historical distribution of annual US unemployment:
+
+\begin{equation}
+z_u = \frac{u_r - \mu_u}{\sigma_u + \epsilon}
+\end{equation}
+
+\noindent The z-score $z_u$ measures how many standard deviations the simulated
+unemployment rate deviates from the historical mean. A larger $|z_u|$ indicates
+a greater departure from historically normal levels, and $H_1(z_u)$ penalises
+this deviation increasingly as the gap widens.
+
+\begin{equation}
+r^{u,\mathrm{center}}_{r}
+=
+-1.0 \cdot H_1(z_u)
+\end{equation}
+
+\begin{equation}
+r^{u,\mathrm{guard}}_{r}
+=
+-\lambda_u
+\left[
+\max(0,\,u_r-u_{\max})
++
+\max(0,\,u_{\min}-u_r)
+\right]
+\end{equation}
+
+\noindent where $\mu_u$ and $\sigma_u$ are the historical mean and standard deviation
+of the annual US unemployment series.
+The z-score term provides a center-seeking signal, while the guardrail term
+prevents the simulated annual unemployment rate from leaving the US historical range.
+We set $u_{\min}$ and $u_{\max}$ from the annual US unemployment series.
+
+\subsection{Inflation}
+
+In the EconAgent environment, the price level goes through a discovery and
+stabilisation phase in the first few years of simulation, during which inflation
+can be highly volatile.
+The inflation terms are therefore active only when $y \geq 4$.
+Price inflation and wage inflation are both penalised by z-score Huber terms:
+
+\begin{equation}
+z_{\pi} = \frac{\pi_r - \mu_{\pi}}{\sigma_{\pi} + \epsilon},
+\qquad
+z_{\pi^w} = \frac{\pi^w_r - \mu_{\pi^w}}{\sigma_{\pi^w} + \epsilon}
+\end{equation}
+
+\begin{equation}
+r^{\pi,\mathrm{center}}_{r}
+=
+-1.0 \cdot H_1(z_{\pi})   \quad \text{(price inflation)}
+\end{equation}
+
+\begin{equation}
+r^{\pi^w,\mathrm{center}}_{r}
+=
+-1.0 \cdot H_1(z_{\pi^w}) \quad \text{(wage inflation)}
+\end{equation}
+
+\begin{equation}
+r^{\pi,\mathrm{guard}}_{r}
+=
+-\lambda_{\pi}
+\left[
+\max(0,\,\pi_r-\pi_{\max})
++
+\max(0,\,\pi_{\min}-\pi_r)
+\right]
+\end{equation}
+
+\begin{equation}
+r^{\pi^w,\mathrm{guard}}_{r}
+=
+-\lambda_{\pi^w}
+\left[
+\max(0,\,\pi^w_r-\pi^w_{\max})
++
+\max(0,\,\pi^w_{\min}-\pi^w_r)
+\right]
+\end{equation}
+
+\noindent where $\mu_{\pi}, \sigma_{\pi}, \mu_{\pi^w}, \sigma_{\pi^w}$ are
+historical moments estimated from annual US price and wage inflation series.
+For price inflation, we set $\pi_{\min}$ and $\pi_{\max}$ from the annual US CPI series.
+For wage inflation, we set $\pi^w_{\min}$ and $\pi^w_{\max}$ from the annual US wage inflation series.
+We use $\lambda_{\pi}=0.5$ and $\lambda_{\pi^w}=0.25$.
+
+\subsection{GDP Growth}
+
+\paragraph{Real and nominal GDP.}
+Let $S_t$ be monthly aggregate supply and $P_t$ the goods price.
+Nominal GDP in year $y$ is $G^n_y = \sum_{t \in y} S_t P_t$.
+Real GDP deflates by the base-year price
+$P_0 = \texttt{env.world.price[0]}$: $G^r_y = \sum_{t \in y} S_t P_0$.
+Their annual growth rates are:
+
+\begin{equation}
+g^n_y = \frac{G^n_y - G^n_{y-1}}{G^n_{y-1}}, \qquad
+g^r_y = \frac{G^r_y - G^r_{y-1}}{G^r_{y-1}}
+      = \frac{\sum_{t \in y} S_t - \sum_{t \in y-1} S_t}
+             {\sum_{t \in y-1} S_t}
+\end{equation}
+
+\paragraph{GDP growth reward.}
+Both growth rates require one year of prior history and are therefore active from year~2.
+We again use distribution-anchored z-score Huber penalties:
+
+\begin{equation}
+z_{g^r} = \frac{g^r_r - \mu_{g^r}}{\sigma_{g^r} + \epsilon},
+\qquad
+z_{g^n} = \frac{g^n_r - \mu_{g^n}}{\sigma_{g^n} + \epsilon}
+\end{equation}
+
+\begin{equation}
+r^{g^r,\mathrm{center}}_{r}
+=
+-1.0 \cdot H_1(z_{g^r})
+\end{equation}
+
+\begin{equation}
+r^{g^n,\mathrm{center}}_{r}
+=
+-1.0 \cdot H_1(z_{g^n})
+\end{equation}
+
+\begin{equation}
+r^{g^r,\mathrm{guard}}_{r}
+=
+-\lambda_{g^r}
+\left[
+\max(0,\,g^r_r-g^r_{\max})
++
+\max(0,\,g^r_{\min}-g^r_r)
+\right]
+\end{equation}
+
+\begin{equation}
+r^{g^n,\mathrm{guard}}_{r}
+=
+-\lambda_{g^n}
+\left[
+\max(0,\,g^n_r-g^n_{\max})
++
+\max(0,\,g^n_{\min}-g^n_r)
+\right]
+\end{equation}
+
+\noindent We set $g^r_{\min}$ and $g^r_{\max}$ from the annual US real GDP growth series,
+and set $g^n_{\min}$ and $g^n_{\max}$ from the annual US nominal GDP growth series.
+We use $\lambda_{g^r}=0.25$ and $\lambda_{g^n}=0.25$.
+
+\subsection{Structural Regularities}
+
+Phillips Curve and Okun's Law are not used as training rewards.
+They are evaluated only in long-horizon frozen-policy simulations after training.
+
+\section{Microeconomic Reward}
+
+\subsection{Work Anti-Collapse Constraint}
+
+We retain a weak work-related penalty only as an anti-collapse safeguard.
+Its purpose is not to match a target unemployment rate, but to prevent the
+policy from converging to the degenerate solution in which almost all agents
+work in every month.
+
+Let
+\[
+\bar l_t = \frac{1}{N}\sum_{i=1}^{N} l_{i,t}
+\]
+denote the fraction of agents working in month $t$, and define
+\[
+c_r = \max_{t=1,\dots,12}\bar l_t .
+\]
+
+We then impose a one-sided barrier:
+
+\begin{equation}
+r^{\mathrm{work}}_{r}
+=
+-\lambda_{\mathrm{work}}
+\max(0,\; c_r-c_{\max})
+\end{equation}
+
+\noindent where we set
+$c_{\max}=0.965$, derived from the historical minimum annual US unemployment rate of %3.5\%
+3.5%.
+and
+$\lambda_{\mathrm{work}}=0.25$.
+This term is intentionally weak and only activates when the economy enters
+an extreme near-all-work regime.
+
+\subsection{Microeconomic Validity Terms}
+
+Microeconomic penalties are defined at the rollout level and are shared by all
+agents in the same replica.
+For replica $r$, let
+$p^{\mathrm{fail}}_{r}$ denote the fraction of all 1,200 agent-month decisions
+(100 agents $\times$ 12 months) whose responses cannot be parsed into a valid
+action JSON, and let
+$p^{\mathrm{inv}}_{r}$ denote the fraction of all 1,200 agent-month decisions
+with invalid actions
+(e.g.\ missing keys, out-of-range values, budget violations, or negative wealth).
+In the implementation, $p^{\mathrm{inv}}_{r}$ is tracked as the sum of an
+out-of-range rate and a budget violation rate, which are logged separately
+for diagnostic purposes.
+
+We normalise both failure rates by tolerance thresholds and apply $H_1(\cdot)$:
+
+\begin{equation}
+r^{\mathrm{fmt}}_{r}
+=
+-2.0 \cdot H_1\!\left(
+\frac{p^{\mathrm{fail}}_{r}}{\tau_{\mathrm{fmt}}}
+\right)
+\end{equation}
+
+\begin{equation}
+r^{\mathrm{valid}}_{r}
+=
+-1.0 \cdot H_1\!\left(
+\frac{p^{\mathrm{inv}}_{r}}{\tau_{\mathrm{valid}}}
+\right)
+\end{equation}
+
+\noindent where we set
+$\tau_{\mathrm{fmt}} = 0.001$
+and
+$\tau_{\mathrm{valid}} = 0.001$.
+Any non-zero failure rate is penalised immediately;
+the tolerance thresholds are set near zero to enforce strict validity.
+
+\noindent The final training reward for replica $r$ is
+\begin{equation}
+R_{r}
+=
+r^{u,\mathrm{center}}_{r}
++r^{u,\mathrm{guard}}_{r}
++\mathbf{1}[y \geq 2]
+\!\left(
+r^{g^r,\mathrm{center}}_{r}
++r^{g^r,\mathrm{guard}}_{r}
++r^{g^n,\mathrm{center}}_{r}
++r^{g^n,\mathrm{guard}}_{r}
+\right)
++\mathbf{1}[y \geq 4]
+\!\left(
+r^{\pi,\mathrm{center}}_{r}
++r^{\pi,\mathrm{guard}}_{r}
++r^{\pi^w,\mathrm{center}}_{r}
++r^{\pi^w,\mathrm{guard}}_{r}
+\right)
++r^{\mathrm{work}}_{r}
++r^{\mathrm{fmt}}_{r}
++r^{\mathrm{valid}}_{r}
+\end{equation}
+
+\section{Summary}
+
+\begin{table}[h]
+\centering
+\renewcommand{\arraystretch}{1.3}
+\begin{tabular}{lllc}
+\toprule
+\textbf{Term} & \textbf{Formula} & \textbf{Normalisation / Range} & \textbf{Active} \\
+\midrule
+\multicolumn{4}{l}{\textit{Shared macroeconomic center terms}} \\
+Unemployment
+  & $-1.0\cdot H_1\!\left(\frac{u_r-\mu_u}{\sigma_u+\epsilon}\right)$
+  & historical mean/std
+  & $y \geq 1$ \\
+Price inflation
+  & $-1.0\cdot H_1\!\left(\frac{\pi_r-\mu_\pi}{\sigma_\pi+\epsilon}\right)$
+  & historical mean/std
+  & $y \geq 4$ \\
+Wage inflation
+    & $-1.0\cdot H_1\!\left(\frac{\pi^w_r-\mu_{\pi^w}}{\sigma_{\pi^w}+\epsilon}\right)$
+  & historical mean/std
+  & $y \geq 4$ \\
+Real GDP growth
+  & $-1.0\cdot H_1\!\left(\frac{g^r_r-\mu_{g^r}}{\sigma_{g^r}+\epsilon}\right)$
+  & historical mean/std
+  & $y \geq 2$ \\
+Nominal GDP growth
+  & $-1.0\cdot H_1\!\left(\frac{g^n_r-\mu_{g^n}}{\sigma_{g^n}+\epsilon}\right)$
+  & historical mean/std
+  & $y \geq 2$ \\
+\midrule
+\multicolumn{4}{l}{\textit{Shared macroeconomic guardrails}} \\
+Unemployment guardrail
+  & $-\lambda_u[\max(0,u_r-u_{\max})+\max(0,u_{\min}-u_r)]$
+  & annual US range
+  & $y \geq 1$ \\
+Price inflation guardrail
+  & $-\lambda_\pi[\max(0,\pi_r-\pi_{\max})+\max(0,\pi_{\min}-\pi_r)]$
+  & annual US range
+  & $y \geq 4$ \\
+Wage inflation guardrail
+  & $-\lambda_{\pi^w}[\max(0,\pi^w_r-\pi^w_{\max})+\max(0,\pi^w_{\min}-\pi^w_r)]$
+  & annual US range
+  & $y \geq 4$ \\
+Real GDP growth guardrail
+  & $-\lambda_{g^r}[\max(0,g^r_r-g^r_{\max})+\max(0,g^r_{\min}-g^r_r)]$
+  & annual US range
+  & $y \geq 2$ \\
+Nominal GDP growth guardrail
+  & $-\lambda_{g^n}[\max(0,g^n_r-g^n_{\max})+\max(0,g^n_{\min}-g^n_r)]$
+  & annual US range
+  & $y \geq 2$ \\
+Work anti-collapse
+  & $-\lambda_{\mathrm{work}}\max(0,c_r-c_{\max})$
+  & $c_{\max}=0.965$
+  & $y \geq 1$ \\
+\midrule
+\multicolumn{4}{l}{\textit{Shared microeconomic terms}} \\
+Format failure
+  & $-2.0\cdot H_1\!\left(\frac{p^{\mathrm{fail}}_{r}}{\tau_{\mathrm{fmt}}}\right)$
+  & $\tau_{\mathrm{fmt}}=0.001$
+  & $y \geq 1$ \\
+Invalid action
+  & $-1.0\cdot H_1\!\left(\frac{p^{\mathrm{inv}}_{r}}{\tau_{\mathrm{valid}}}\right)$
+  & $\tau_{\mathrm{valid}}=0.001$
+  & $y \geq 1$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section{VERL-GRPO Training Pipeline}
+
+We train a shared Qwen2.5-7B-Instruct policy in the original EconAgent environment using GRPO. Unlike a static prompt dataset, each monthly input is constructed online from the current economic state, so rollouts must be generated through environment interaction.
+We implement this pipeline in VERL rather than treating GRPO as a standalone optimiser outside the rollout framework. Concretely, VERL is used for three functions: (i) multi-turn rollout collection over the live EconAgent environment, (ii) token-level masking so that only policy-generated action tokens are optimised, and (iii) GRPO group-based policy updates from replica-level rewards. This design follows the same general principle used in search-augmented RL such as Search-R1, where the external system is treated as part of the environment and the optimisation is applied only to model-generated tokens rather than environment-inserted content.
+
+
+\paragraph{Stage 0: Economy-state storage from year 1 onward.}
+Before RL training, we store restorable economy states from year 1 onward. Each stored state contains the world state, agent states, environment RNG state, and the historical statistics needed to resume prompting and compute annual macroeconomic metrics. The goal is to preserve the full economy trajectory from cold start rather than discarding the early unstable years. Reward components are then activated by year through gating.
+
+\paragraph{Stage 1: Sampling an initial economy state.}
+At each GRPO update, one annual initial state $s_y$ is sampled from the stored state bank, where $y$ denotes the current year index. This state is used as the common starting point for the rollout group.
+
+\paragraph{Stage 2: Replica construction from a shared initial economy state.}
+Given the same sampled state $s_y$, we create four replicas for one GRPO group. Each replica starts from the same restored economy state, including the same world state, agent states, and historical statistics.
+
+In principle, one could fix the environment random seed within a group and vary only the policy sampling seed, so that within-group reward differences are attributed purely to policy differences. This requires a strict separation between environment RNG and policy RNG, which is not fully implemented in the current V1 system.
+
+Moreover, even under fixed environment randomness, the environment transitions remain policy-dependent: wage and price perturbations are scaled by the supply–demand imbalance $\bar{\varphi}$, which is itself determined by agent decisions. As a result, replicas will diverge in their economic trajectories due to differences in sampled actions, even when environment randomness is controlled.
+
+The operative guarantee in V1 is therefore that all replicas share the same \emph{initial} economy state. Within-group reward differences then primarily reflect differences in sampled policy actions, which is sufficient for GRPO group normalization to produce a meaningful advantage signal.
+
+\paragraph{Stage 3: One replica as a one-year multi-agent episode.}
+Each replica is one complete economy-year episode with:
+\begin{itemize}
+    \item 100 agents,
+    \item 12 monthly steps,
+    \item joint participation of all agents at every month.
+\end{itemize}
+A focal-agent simplification is not used, because unemployment, inflation, and GDP are aggregate outcomes jointly determined by all agents.
+Accordingly, the GRPO reward unit is not a single agent-month response, but the full one-year multi-agent rollout of one replica.
+
+
+\paragraph{Stage 4: Monthly online prompt construction.}
+At the beginning of each month, the environment constructs each agent's input context online from:
+\begin{itemize}
+    \item the current macroeconomic state and the agent's personal state,
+    \item recent dialogue history from \texttt{dialog\_queue} (window of 3 turns).
+\end{itemize}
+At the first month of each quarter, the context is augmented with the two
+most recent entries from \texttt{dialog4ref\_queue}, which contain the
+previous quarter's reflection question and the agent's reflection response.
+This gives the agent access to its own quarterly economic summary when
+making decisions at the start of a new quarter.
+The policy then generates that agent's monthly action response. Training
+inputs are not fixed offline prompts but dynamically generated monthly
+contexts produced during rollout.
+
+\paragraph{Stage 5: Trajectory representation.}
+We distinguish between two levels of trajectory.
+
+First, one replica defines one environment-level trajectory:
+\[
+\tau^{\mathrm{env}}_r
+=
+\{s_{r,1}, \mathbf{a}_{r,1}, s_{r,2}, \mathbf{a}_{r,2}, \ldots, s_{r,12}, \mathbf{a}_{r,12}\},
+\]
+where $\mathbf{a}_{r,m}$ is the joint action of all 100 agents at month $m$. This is the trajectory level on which the annual reward is defined.
+
+Second, within the same replica, each agent induces one text trajectory:
+\[
+\tau^{\mathrm{text}}_{r,i}
+=
+\{(c_{r,i,1}, a_{r,i,1}), \ldots, (c_{r,i,12}, a_{r,i,12})\},
+\]
+where $c_{r,i,m}$ is the full monthly context and $a_{r,i,m}$ is the model-generated JSON action for agent $i$ at month $m$.
+
+This separation is important: GRPO compares replicas at the environment-trajectory level, while token-level optimisation is carried out on the agent text trajectories unfolded from the same replica.
+
+
+\paragraph{Stage 6: Token masking.}
+Only tokens generated by the policy model itself are optimized. All environment-provided context tokens are masked out, including:
+\begin{itemize}
+    \item the current monthly user prompt,
+    \item dialogue history,
+    \item quarterly reflection text when it appears in later context,
+    \item any text serialized from environment states.
+\end{itemize}
+As a result, only monthly assistant response tokens contribute to log-probability, importance-ratio, and KL computations.
+Operationally, the monthly prompt, dialogue history, and quarterly reflection are concatenated as environment-provided interaction state, while only the newly generated monthly action JSON is treated as the optimised response segment for that turn.
+
+
+\paragraph{Stage 7: Annual replica-level reward computation.}
+After a replica finishes its 12-month rollout, we compute one annual scalar reward $R_r$ for that replica. This reward is shared by all 100 agents in the replica. It consists of:
+\begin{itemize}
+    \item macroeconomic terms: unemployment, real GDP growth, nominal GDP growth, price inflation, and wage inflation, each with a center term and a guardrail term,
+    \item a weak work anti-collapse penalty,
+    \item microeconomic penalties: format failure rate and invalid action rate.
+\end{itemize}
+Reward components are activated by year according to the reward design.
+In implementation terms, this reward is computed only after the full annual rollout has finished, from environment-side statistics recorded during the rollout rather than from the final text response alone. The reward is therefore injected into VERL as a rollout-level scalar attached to the completed replica.
+In implementation terms, this corresponds to replacing the QA-style exact-match scorer in Search-R1 with an environment-aware reward function that reads annual macro statistics from the completed rollout metadata.
+
+\paragraph{Stage 8: GRPO group computation.}
+The four replicas derived from the same initial state form one GRPO group:
+\[
+\mathcal{G}(s_y) = \{r_1, r_2, r_3, r_4\}.
+\]
+Let their annual rewards be $R_{r_1}, R_{r_2}, R_{r_3}, R_{r_4}$. We compute a replica-level relative advantage by group normalization:
+\[
+A_r = \frac{R_r - \mu_{\mathcal{G}}}{\sigma_{\mathcal{G}} + \epsilon},
+\]
+where $\mu_{\mathcal{G}}$ and $\sigma_{\mathcal{G}}$ are the mean and standard deviation of rewards inside the group. This advantage is then broadcast to all unmasked response tokens in that replica.
+All 100 agent trajectories within the same replica receive the identical
+advantage value, which is the direct consequence of the replica-level reward design.
+A per-agent reward is deliberately not used here, because the training targets are macroeconomic aggregates jointly induced by all agents in the same economy-year rollout.
+
+
+\paragraph{Stage 9: Token-level GRPO optimization.}
+For all retained response tokens, VERL recomputes:
+\begin{itemize}
+    \item old log-probabilities,
+    \item new log-probabilities,
+    \item importance ratios,
+    \item KL divergence to the reference policy.
+\end{itemize}
+GRPO loss is applied only to response tokens. KL is used as a loss regularizer rather than being injected into the reward.
+Formally, for replica $r$, the retained-token loss is aggregated as
+\[
+L_r
+=
+\frac{1}{N}
+\sum_{i=1}^{N}
+\frac{1}{12}
+\sum_{m=1}^{12}
+\frac{1}{|Y_{r,i,m}|}
+\sum_{t \in Y_{r,i,m}}
+\ell_{r,i,m,t}(A_r),
+\]
+where $Y_{r,i,m}$ is the retained token set of the monthly response from agent $i$ at month $m$.
+Because the reward and advantage are defined at the replica level, the same $A_r$ is broadcast to all retained response tokens in replica $r$. To avoid implicitly overweighting replicas with longer outputs, the loss is aggregated hierarchically: it is first averaged over tokens within each monthly response, then over the 12 monthly responses of each agent, and then over the 100 agents in the replica. As a result, the replica remains the unit of GRPO comparison, while token-length variation does not distort the effective contribution of one replica to the update.
+
+\paragraph{Stage 10: Parameter update and next rollout.}
+After one GRPO update, a new initial economy state is sampled from the stored state bank, and the above process is repeated until training ends.
+
+\paragraph{Agent loop.}
+The pipeline proceeds as follows:
+
+\[
+\begin{array}{c}
+\text{sample initial state } s_y \text{ from state bank}\\[4pt]
+\downarrow\\[4pt]
+\text{create } K=4 \text{ replicas, each restored from } s_y\\[4pt]
+\downarrow\\[4pt]
+\underbrace{
+  \begin{array}{c}
+    \text{build monthly contexts } c_{r,i,m} \text{ for all 100 agents}\\[3pt]
+    \downarrow\\[3pt]
+    \text{generate JSON actions } a_{r,i,m}
+    \;\;[\text{response tokens: optimised}]\\[3pt]
+    \downarrow\\[3pt]
+    \text{form joint action } \mathbf{a}_{r,m}
+    \;\rightarrow\;
+    \text{env step}
+    \;\rightarrow\;
+    s_{r,m+1}\\[3pt]
+    \downarrow\\[3pt]
+    \text{update } \texttt{dialog\_queue},\;
+    \texttt{dialog4ref\_queue}
+    \;\;[\text{context tokens: masked}]
+  \end{array}
+}_{\displaystyle m = 1,\,\dots,\,12}\\[10pt]
+\downarrow\\[4pt]
+\text{compute annual reward } R_r
+\text{ from environment statistics}\\[4pt]
+\downarrow\\[4pt]
+A_r \;=\;
+\dfrac{R_r - \mu_{\mathcal{G}}}{\sigma_{\mathcal{G}} + \varepsilon}
+\qquad
+\mathcal{G} = \{r_1, r_2, r_3, r_4\}\\[8pt]
+\downarrow\\[4pt]
+\text{broadcast } A_r
+\text{ to all response tokens in replica } r\\
+\text{and aggregate loss hierarchically over token/month/agent levels}\\[4pt]
+\downarrow\\[4pt]
+\text{VERL GRPO update}
+\quad (\texttt{ppo\_epochs} = 1)\\[4pt]
+\downarrow\\[4pt]
+\text{sample next } s_y \text{ and repeat}
+\end{array}
+\]
+
+Within each month, the per-agent information flow is:
+\[
+c_{r,i,m}
+\;\rightarrow\;
+a_{r,i,m}
+\;\rightarrow\;
+\mathbf{a}_{r,m}
+\;\rightarrow\;
+s_{r,m+1}
+\;\rightarrow\;
+c_{r,i,m+1},
+\]
+where the local action $a_{r,i,m}$ enters the joint action $\mathbf{a}_{r,m}$,
+which drives the shared macroeconomic transition and produces
+the next context for all agents.
+\clearpage
+\begin{tabular}{ll}
+\toprule
+\textbf{Symbol} & \textbf{Description} \\
+\midrule
+$A_r$ & Advantage of replica $r$ \\
+$\mu_G$ & Mean reward of the 4 replicas in the same group \\
+$\sigma_G$ & Standard deviation of reward of the 4 replicas in the same group \\
+$r$ & Replica index \\
+$i$ & Agent index \\
+$c_{r,i,m}$ & Input context of agent $i$ in replica $r$ at month $m$ \\
+$o_{r,i,m}$ & JSON action generated by agent $i$ in replica $r$ at month $m$ \\
+$a_{r,m}$ & Collection of all 100 agents' actions in replica $r$ at month $m$ \\
+$s_{r,m+1}$ & Economic state at month $m{+}1$ after environment transition via joint actions \\
+$c_{r,i,m+1}$ & Context for month $m{+}1$ constructed from $s_{r,m+1}$ \\
+\bottomrule
+\end{tabular}
+\end{document}

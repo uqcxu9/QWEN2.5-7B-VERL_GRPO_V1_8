@@ -1,0 +1,351 @@
+================================================================================
+EconAgent + Reward 接入 Search-R1 / VERL (GRPO) — Qwen3-4B-Instruct-2507
+完整环境配置与代码改动总结
+日期: 2026-04-08
+================================================================================
+
+一、项目目标
+===========
+用 Qwen3-4B-Instruct-2507 在 VERL 0.7.1 框架下做 GRPO 训练，
+将 EconAgent 经济仿真环境（100 agents, 12 months, 4 replicas）作为
+RL 环境接入 Search-R1 的 pipeline，用 environment step 替代 search step。
+
+二、目录结构
+===========
+/workspace/
+├── Search-R1/                          # 主项目（含 verl fork + econ 接入代码）
+│   ├── verl/                           # verl 0.7.1 + econ 改动（从 pip 包复制后修改）
+│   ├── verl_old_fork/                  # 旧版 verl fork 备份
+│   ├── search_r1/llm_agent/
+│   │   ├── econ_generation_manager.py  # EconAgent rollout 主逻辑 + EconVLLMGenerateWrapper
+│   │   ├── econ_reward_adapter.py      # token-level reward 分配
+│   │   ├── generation.py               # 通用 generation（非 econ 用）
+│   │   └── tensor_helper.py
+│   ├── train_econ_grpo_qwen3_4b.sh     # ★ Qwen3 训练脚本
+│   ├── train_econ_grpo_3b_small_exp.sh # 旧 3B 小实验脚本
+│   └── econagent_searchr1_verl_grpo_bundle.md  # 原始 bundle 文档
+│
+├── QWEN2.5_42_7b_main/                # EconAgent 环境 + reward + state bank
+│   ├── ai_economist/                   # ACL24 经济仿真环境
+│   ├── config.yaml                     # 环境配置
+│   ├── simulate.py                     # 环境仿真 + snapshot restore
+│   ├── simulate_utils.py               # Qwen 推理工具
+│   ├── rollout_collector.py            # action 解析 + env stats 收集
+│   ├── reward_builder.py               # 年度 reward 计算
+│   ├── grpo_exporter.py                # GRPO 样本导出
+│   ├── dry_run_grpo_pipeline.py        # 年度 metrics 构建
+│   ├── build_state_bank.py             # state bank 索引/加载
+│   ├── make_state_bank.py              # state bank 生成脚本
+│   └── data/
+│       ├── state_bank/                 # ★ state bank JSON + snapshot pkl
+│       │   ├── state_bank.json         # 20 条记录 (year 2-21)
+│       │   └── snapshots/y{2..21}/     # 每年 5 个 pkl 文件
+│       ├── train_stub.parquet          # Hydra 占位文件（econ 不读）
+│       └── val_stub.parquet
+│
+├── model/
+│   ├── Qwen3-4B-Instruct-2507/        # ★ 模型文件
+│   └── Qwen2.5-3B-Instruct/           # 旧 3B 模型
+│
+└── venvs/
+    ├── verl_latest/                    # ★ 训练虚拟环境
+    └── train_vllm063/                  # 旧 vllm 0.6.3 环境（弃用）
+
+三、环境配置（从零搭建步骤）
+============================
+
+3.1 创建虚拟环境
+-----------------
+python -m venv /workspace/venvs/verl_latest
+
+3.2 安装核心依赖
+-----------------
+# 先装 torch（vllm 0.11 会自动拉 torch 2.9）
+/workspace/venvs/verl_latest/bin/pip install torch==2.6.0 --index-url https://download.pytorch.org/whl/cu124
+
+# 装 vllm 0.11.2（支持 Qwen3，且有 verl 需要的 run_headless API）
+# 注意：不要用 vllm 0.12+（cumem allocator 和 CUDA driver 580.95 不兼容）
+/workspace/venvs/verl_latest/bin/pip install "vllm>=0.9,<0.12"
+
+# 装 verl 0.7.1
+/workspace/venvs/verl_latest/bin/pip install verl==0.7.1
+
+# 装 flash-attn（需要和 torch 版本匹配，vllm 0.11 拉的 torch 2.9 可以装）
+/workspace/venvs/verl_latest/bin/pip install flash-attn --no-build-isolation
+
+# 装其他依赖
+/workspace/venvs/verl_latest/bin/pip install \
+    hydra-core omegaconf wandb tensordict \
+    accelerate lz4 codetiming fire \
+    scipy seaborn matplotlib python-dateutil \
+    "numpy<2.0" "opentelemetry-sdk>=1.29" "opentelemetry-api>=1.29"
+
+3.3 版本确认（必须）
+---------------------
+torch:          2.9.0+cu128   （vllm 0.11 会拉 2.9）
+vllm:           0.11.2
+transformers:   4.57.6        （支持 Qwen3）
+verl:           0.7.1         （pip show 显示 0.7.1，import 可能显示 0.1 因为 PYTHONPATH 覆盖）
+flash-attn:     2.8.3
+numpy:          1.26.4        （<2.0，verl 要求）
+ray:            2.54.1
+
+3.4 下载模型
+-------------
+huggingface-cli download Qwen/Qwen3-4B-Instruct-2507 \
+    --local-dir /workspace/model/Qwen3-4B-Instruct-2507
+
+3.5 生成 State Bank（用训练 venv 的 numpy 序列化，避免 pickle 兼容问题）
+------------------------------------------------------------------------
+cd /workspace/QWEN2.5_42_7b_main
+PYTHONPATH=/workspace/QWEN2.5_42_7b_main \
+/workspace/venvs/verl_latest/bin/python make_state_bank.py \
+    --num-agents 100 \
+    --episode-length 240 \
+    --state-bank-out /workspace/QWEN2.5_42_7b_main/data/state_bank/state_bank.json
+
+# 验证：应该生成 20 个 year 的 snapshot pkl
+ls data/state_bank/snapshots/ | wc -l   # 应该是 20
+ls data/state_bank/snapshots/y2/        # 应该有 5 个 pkl
+
+3.6 生成 stub parquet（Hydra 占位）
+------------------------------------
+python -c "
+import pyarrow as pa, pyarrow.parquet as pq
+t = pa.table({'prompt': ['stub'], 'data_source': ['stub']})
+pq.write_table(t, '/workspace/QWEN2.5_42_7b_main/data/train_stub.parquet')
+pq.write_table(t, '/workspace/QWEN2.5_42_7b_main/data/val_stub.parquet')
+"
+
+3.7 替换 verl 源码（将 pip verl 复制到 Search-R1 并加 econ 改动）
+-------------------------------------------------------------------
+cp -r /workspace/venvs/verl_latest/lib/python3.12/site-packages/verl /workspace/Search-R1/verl
+# 然后应用下面第四节的代码改动
+
+四、代码改动清单（相对于 pip verl 0.7.1 原版）
+================================================
+
+4.1 /workspace/Search-R1/verl/trainer/main_ppo.py
+--------------------------------------------------
+改动：在 TaskRunner.run() 里加 econ dataset 注入
+
+- 在 resource_pool_manager 初始化后，判断 econ.enabled
+- 当 econ.enabled=true 时，用 EconStateBankDataset 替代 RLHFDataset
+- 文件末尾加了 _create_econ_datasets() 函数（含 EconStateBankDataset, EconStubDataset, econ_collate）
+
+4.2 /workspace/Search-R1/verl/trainer/ppo/ray_trainer.py
+---------------------------------------------------------
+改动：在 fit() 循环里加 econ 分支
+
+- 顶部加了 _econ_enabled() 函数
+- 在 fit() 的 self.global_steps += 1 之后，加了 EconGenerationManager 初始化
+  - 传 EconVLLMGenerateWrapper（而非 actor_rollout_wg）作为 generate 接口
+  - 获取 vLLM server handles 从 async_rollout_manager.rollout_replicas
+- 在训练循环里，econ 分支：
+  1. checkpoint_manager.update_weights() — 同步 FSDP 权重到 vLLM
+  2. econ_generation_manager.run_econ_year_loop() — 完整年度 rollout
+  3. checkpoint_manager.sleep_replicas() — 释放 vLLM 显存
+  4. _compute_old_log_prob() — 计算 log prob
+  5. compute_advantage(adv_estimator="grpo") — GRPO 归一化
+  6. _update_actor() — 更新模型
+  7. Log reward breakdown 到 wandb
+  8. continue 跳过标准路径
+- 标准（非 econ）路径在 econ 分支的 continue 之后，不受影响
+
+4.3 /workspace/Search-R1/verl/third_party/vllm/__init__.py
+------------------------------------------------------------
+改动：让 VLLM_SLEEP_LEVEL 可通过环境变量控制
+
+    import os as _os
+    if _os.environ.get("VLLM_SLEEP_LEVEL") is not None:
+        VLLM_SLEEP_LEVEL = int(_os.environ["VLLM_SLEEP_LEVEL"])
+    elif vs.parse(package_version) >= vs.parse("0.8.5"):
+        VLLM_SLEEP_LEVEL = 2
+
+4.4 /workspace/Search-R1/search_r1/llm_agent/econ_generation_manager.py
+-------------------------------------------------------------------------
+改动 1：加了 EconVLLMGenerateWrapper 类（文件顶部）
+  - 绕过 fsdp_workers 的 async event loop 冲突
+  - 直接通过 Ray remote 调 vLLM server 的 per-sequence generate() API
+  - 接口：generate_sequences(DataProto) → DataProto（与旧版兼容）
+
+改动 2：compute_replica_reward() 保留 reward breakdown
+  - self._last_reward_breakdown, self._last_reward_R_macro, self._last_reward_R_micro
+
+改动 3：replicas_payload 里加了 reward_breakdown, R_macro, R_micro
+
+改动 4：payload 里加了 mean_reward_breakdown（4 个 replica 的平均 breakdown）
+
+4.5 /workspace/Search-R1/search_r1/llm_agent/econ_reward_adapter.py
+---------------------------------------------------------------------
+改动：expand_advantage_to_response() 字段名修复
+  - 优先读 batch.batch["advantages"]（verl GRPO 设置的 token-level tensor）
+  - fallback 到 batch.batch["annual_reward"]
+  （此函数当前为 dead code，防御性修复）
+
+4.6 /workspace/QWEN2.5_42_7b_main/rollout_collector.py
+--------------------------------------------------------
+改动：parse_action_json() 计数器口径分离
+  - missing keys / parse error → 只增 invalid_action_count（不再同时增 out_of_range_count）
+  - out of range values → 只增 out_of_range_count
+  - 修复了 reward_builder 的 micro penalty 双倍计数 bug
+
+五、训练脚本关键配置（train_econ_grpo_qwen3_4b.sh）
+=====================================================
+
+关键环境变量：
+  VLLM_SLEEP_LEVEL=0                    # 禁用 cumem allocator（CUDA driver 580.95 兼容性）
+  VLLM_WORKER_MULTIPROC_METHOD=spawn
+  VLLM_ATTENTION_BACKEND=XFORMERS
+
+关键 hydra 参数（针对单卡 H100 80GB 显存优化）：
+  gpu_memory_utilization=0.18           # vLLM 只用 ~14GB（模型 8GB + 最小 KV cache）
+  max_model_len=864                     # 限制 KV cache 大小（prompt ~700 + response ~48）
+  enforce_eager=true                    # 禁 CUDA graph
+  ++enable_sleep_mode=false             # 禁 sleep mode（避免 cumem bug）
+  free_cache_engine=false               # 不释放 cache（与 sleep_mode=false 配合）
+  optimizer_offload=true                # Adam state 尝试 offload（单卡可能不生效）
+  ++override_optimizer_config={foreach: false}  # 禁用 foreach optimizer（省临时显存）
+  ++override_config.attn_implementation=flash_attention_2  # 用 flash attention
+
+econ 专用参数：
+  ++econ.enabled=true
+  ++econ.num_agents=100
+  ++econ.num_months=12                  # 完整年度
+  ++econ.replica_group_size=4           # GRPO 4 replicas
+  ++econ.rollout_agent_micro_batch=16   # 每批 16 个 agent 送 vLLM
+  ++econ.rollout_prompt_length=768      # prompt 最大 token 长度
+  ++trainer.val_before_train=false      # 跳过训练前验证（省时间）
+  trainer.total_epochs=3                # 3 个 epoch = 60 steps
+
+六、启动训练
+=============
+cd /workspace/Search-R1
+
+# 1. 启动 Ray（用训练 venv 的 python）
+/workspace/venvs/verl_latest/bin/ray start --head --num-gpus=1 --include-dashboard=false
+
+# 2. wandb 登录（如果还没有）
+/workspace/venvs/verl_latest/bin/wandb login
+
+# 3. 启动训练
+export VLLM_TRAIN_VENV=/workspace/venvs/verl_latest
+bash train_econ_grpo_qwen3_4b.sh
+
+# 4. 实时监控
+tail -f econagent-grpo-qwen3-4b-v1.log
+
+七、已知问题与解决方案
+=======================
+
+7.1 cumem_allocator CUDA Error: invalid argument
+  原因：vllm 0.9+ 的 cumem allocator 和 CUDA driver 580.95 不兼容
+  解决：VLLM_SLEEP_LEVEL=0 + enable_sleep_mode=false + free_cache_engine=false
+  代价：vLLM 不会在训练时释放显存，需要压缩 gpu_memory_utilization
+
+7.2 单卡 80GB OOM
+  原因：4B 模型训练需要 ~62GB + vLLM ~14GB = 76GB，optimizer step 需要临时空间
+  解决：gpu_memory_utilization=0.18, max_model_len=864, foreach=false
+  如果还 OOM：考虑换 2 卡机器，或用 Qwen2.5-3B-Instruct
+
+7.3 async event loop 冲突
+  原因：verl 0.7.1 用 AsyncActorRolloutRefWorker，直接调 generate_sequences 会
+        触发 run_until_complete 在 uvloop 里嵌套报错
+  解决：EconVLLMGenerateWrapper 直接调 vLLM server handle，绕过 fsdp_workers
+
+7.4 transformers 版本
+  Qwen3 需要 transformers >= 4.51
+  vllm 0.6.3 需要 transformers < 4.46
+  → 必须用 vllm 0.9+
+
+7.5 numpy pickle 兼容
+  state bank pkl 必须用训练 venv 的 numpy 序列化（numpy 1.26 vs 2.x 不兼容）
+
+7.6 opentelemetry 版本
+  Ray 2.54 dashboard 需要 opentelemetry-api >= 1.29
+  vllm 0.8.5 pin opentelemetry < 1.27
+  → pip install "opentelemetry-sdk>=1.29" "opentelemetry-api>=1.29"
+  → 或 ray start --include-dashboard=false 绕过
+
+八、数据流总览
+===============
+
+State Bank (year N snapshot)
+  → restore_env_snapshot() → env, obs, memory
+  → clone 4 replicas
+  → 每个 replica 跑 12 个月:
+      → build_monthly_prompt_from_state() → prompt text
+      → tokenize → DataProto → EconVLLMGenerateWrapper.generate_sequences()
+        → vLLM server generate (Ray remote) → response tokens
+      → batch_decode → parse_action_json() → env.step()
+      → collect_env_stats_step() → monthly_series
+      → update_memory_state()
+      → 每 3 月: quarterly reflection
+  → build_annual_metrics() → compute_annual_reward() → R_r + breakdown
+  → _compute_group_advantages() → A_r = (R_r - μ) / (σ + ε)
+  → export_grpo_samples() → tokenized samples with loss_mask
+  → _stack_grpo_samples_to_dataproto() → DataProto batch
+
+→ checkpoint_manager.sleep_replicas() （释放 vLLM，如果 sleep_mode 开的话）
+→ compute_log_prob() → old_log_probs
+→ compute_ref_log_prob() → ref_log_prob
+→ build_replica_token_level_scores() → token_level_rewards
+→ compute_advantage(adv_estimator="grpo") → advantages
+→ update_actor() → GRPO policy gradient update
+→ log to wandb (reward breakdown + env stats + actor metrics)
+
+九、W&B 监控指标
+=================
+econ_reward/u_center          失业率 z-score 惩罚
+econ_reward/u_guard           失业率越界惩罚
+econ_reward/work_guard        工作率反坍缩
+econ_reward/real_gdp_center   实际 GDP 增长
+econ_reward/nominal_gdp_center 名义 GDP 增长
+econ_reward/pi_center         价格通胀
+econ_reward/wage_pi_center    工资通胀
+econ_reward/fmt               格式错误惩罚
+econ_reward/valid             无效 action 惩罚
+econ_reward/R_macro           宏观 reward 总和
+econ_reward/R_micro           微观 reward 总和
+econ_env/format_fail_count    格式解析失败次数
+econ_env/invalid_action_count 无效 action 次数
+econ_env/out_of_range_count   越界次数
+econ_env/fallback_action_count 回退默认 action 次数
+critic/score/mean             总 reward 均值（越接近 0 越好）
+actor/pg_loss                 policy gradient loss
+actor/kl_loss                 KL 散度 loss
+actor/entropy_loss            策略熵
+
+十、如果换新机器
+=================
+1. 如果 CUDA driver >= 590（较新），vllm 0.11 的 cumem 可能没 bug
+   → 可以开 enable_sleep_mode=true, free_cache_engine=true
+   → gpu_memory_utilization 可以调到 0.35+
+   → 不需要 VLLM_SLEEP_LEVEL=0
+
+2. 如果有 2 张 GPU
+   → tensor_model_parallel_size=2
+   → gpu_memory_utilization=0.4
+   → 不需要 optimizer_offload
+
+3. 如果有 A100 40GB
+   → 4B 模型放不下，换 Qwen2.5-3B-Instruct + 旧 vllm 0.6.3 环境
+
+================================================================================
+
+十一、重要排查记录（2026-04-08 补充）
+=======================================
+
+11.1 模型下载不完整导致 format_fail = 100%
+  症状：econ_env/format_fail_count = 1200（全部失败），R_micro = -2000
+  原因：huggingface-cli download 创建了目录但文件没下完（只有 .cache 子目录）
+  验证：ls /workspace/model/Qwen3-4B-Instruct-2507/ 看是否有 *.safetensors 和 config.json
+  修复：rm -rf 后重新 huggingface-cli download
+
+11.2 如何判断模型是否正常输出 JSON
+  看 wandb 上 econ_env/format_fail_count：
+    - 0 或接近 0 = 模型输出正确 JSON
+    - ~1200 = 几乎全部解析失败 = 模型问题（权重错/thinking mode 干扰等）
+  看 econ_reward/fmt：
+    - 接近 0 = 好
+    - < -1000 = 严重格式问题
